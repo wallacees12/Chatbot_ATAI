@@ -1,6 +1,7 @@
 from speakeasypy import Speakeasy, Chatroom
 from typing import List
 import time
+import rdflib
 
 DEFAULT_HOST_URL = 'https://speakeasy.ifi.uzh.ch'
 listen_freq = 2
@@ -12,7 +13,9 @@ class Agent:
         
         # Initialize the Speakeasy Python framework and login.
         self.speakeasy = Speakeasy(host=DEFAULT_HOST_URL, username=username, password=password)
-        self.speakeasy.login()  # This framework will help you log out automatically when the program terminates.
+        self.speakeasy.login()  # This framework will help you log out automatically when thpf de program terminates.
+        self.graph = rdflib.Graph()
+        self.graph.parse('14_graph.nt', format='turtle')
 
     def listen(self):
         while True:
@@ -33,9 +36,20 @@ class Agent:
                         f"- {self.get_time()}")
 
                     # Implement your agent here #
+                    result = self.graph.query(message.message)
+                    response_message = f"Query results:\n"
+                    
+                    # Collecting Response
+                    for row in result:
+                        # Each row contains information, we just want the literal i.e. 'Forrest Gump'
+                        for item in row:
+                            if isinstance(item, rdflib.term.Literal):
+                                response_message += f"{item.value}\n"
 
-                    # Send a message to the corresponding chat room using the post_messages method of the room object.
-                    room.post_messages(f"Received your message: '{message.message}' ")
+                    room.post_messages(response_message.strip())
+
+            
+
                     # Mark the message as processed, so it will be filtered out when retrieving new messages.
                     room.mark_as_processed(message)
 
