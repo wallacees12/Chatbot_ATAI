@@ -1,194 +1,281 @@
 from speakeasypy import Speakeasy, Chatroom
 from typing import List
-import os
 import time
 import rdflib
-import nltk
-from transformers import BertForTokenClassification, AutoTokenizer, AutoModel, pipeline
-import torch
-import gc
-import psutil
-import torch.multiprocessing as mp
-
-
-# Download necessary resources for NLTK
-nltk.download('punkt')
+import os
+import numpy as np
+from sklearn.metrics.pairwise import pairwise_distances
+import spacy
+import difflib
+from spacy.pipeline import EntityRuler
+import json
 
 DEFAULT_HOST_URL = 'https://speakeasy.ifi.uzh.ch'
 listen_freq = 2
-# Disable tokenizers' parallelism
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-# Set the multiprocessing start method
-mp.set_start_method("spawn", force=True)
-
-# Limit PyTorch threads to reduce memory usage
-torch.set_num_threads(1)
-
-
-def print_memory_usage():
-    memory_info = psutil.virtual_memory()
-    print(f"Memory usage: {memory_info.percent}%")
 
 class Agent:
     def __init__(self, username, password):
         self.username = username
-        
-        # Initialize the Speakeasy Python framework and login.
+
         self.speakeasy = Speakeasy(host=DEFAULT_HOST_URL, username=username, password=password)
-        self.speakeasy.login()  # This framework will help you log out automatically when the program terminates.
-        
-        # Load the RDF knowledge graph
+        self.speakeasy.login()
         self.graph = rdflib.Graph()
         self.graph.parse('14_graph.nt', format='turtle')
-        
-        # Set up Huggingface models for NER and embeddings
-        self.ner = pipeline(
-            "ner",
-            model=BertForTokenClassification.from_pretrained("prajjwal1/bert-tiny"),
-            tokenizer=AutoTokenizer.from_pretrained("prajjwal1/bert-tiny")
-        )
 
-        self.tokenizer = AutoTokenizer.from_pretrained("prajjwal1/bert-tiny")
-        self.model = AutoModel.from_pretrained("prajjwal1/bert-tiny").to(torch.device("cpu"))
+        self.label_to_entity = self.build_label_to_entity_dict()
+        self.ent2lbl = {ent: str(lbl) for ent, lbl in self.graph.subject_objects(rdflib.RDFS.label)}
+        self.relation_to_uri = self.build_relation_to_uri_dict()
 
-        try:
-            print("Testing NER...")
-            print_memory_usage()
-            test_result = self.ner("Who is the director of Inception?")
-            print(f"NER Test Result: {test_result}")
-            print_memory_usage()
-        except Exception as e:
-            print(f"An error occurred during NER: {e}")
+        self.entity_emb, self.relation_emb, self.ent2id, self.id2ent, self.rel2id, self.id2rel = self.load_embeddings()
+        self.nlp = spacy.load('en_core_web_md')
+        self.nlp = self.add_movie_title_patterns(self.nlp)
 
-        try:
-            print("Testing embedding...")
-            embedding = self.get_embedding("This is a test sentence.")
-            print(f"Embedding: {embedding}")
-            print_memory_usage()
-        except Exception as e:
-            print(f"An error occurred during embedding: {e}")
+    def add_movie_title_patterns(self, nlp):
+        ruler = nlp.add_pipe('entity_ruler', before='ner')
+        patterns = [
+            {
+                "label": "WORK_OF_ART",
+                "pattern": "Star Wars: Episode VI - Return of the Jedi"
+            },
+            {
+                "label": "WORK_OF_ART",
+                "pattern": "The Godfather"
+            },
+            {
+                "label": "WORK_OF_ART",
+                "pattern": "Apocalypse Now"
+            },
+            {
+                "label": "WORK_OF_ART",
+                "pattern": "The Masked Gang: Cyprus"
+            },
+            {
+                "label": "WORK_OF_ART",
+                "pattern": "Star Wars"
+            },
+            {
+                "label": "WORK_OF_ART",
+                "pattern": [{"LOWER": "star"}, {"LOWER": "wars"}, {"LOWER": "episode"}, {"IS_DIGIT": True}]
+            },
+            {
+                "label": "WORK_OF_ART",
+                "pattern": [{"LOWER": "episode"}, {"IS_DIGIT": True}, {"TEXT": "-", "OP": "?"}, {"LOWER": "return"}, {"LOWER": "of"}, {"LOWER": "the"}, {"LOWER": "jedi"}]
+            },
+            {
+                "label": "WORK_OF_ART",
+                "pattern": [{"TEXT": "The"}, {"TEXT": "Godfather"}]
+            },
+            {
+                "label": "WORK_OF_ART",
+                "pattern": [{"TEXT": "Apocalypse"}, {"TEXT": "Now"}]
+            },
+            # Add more patterns as needed
+        ]
+        ruler.add_patterns(patterns)
+        return nlp
 
-        # Free up memory manually
-        del test_result, embedding
-        
-        torch.cuda.empty_cache()
-        gc.collect()
-    
-            
-    # Function to classify the question type
-    def classify_question(self, question: str) -> str:
-        tokens = nltk.word_tokenize(question.lower())
-        
-        if "director" in tokens or "screenwriter" in tokens or "released" in tokens:
-            return "factual"
-        elif "embedding" in tokens or "suggest" in tokens or "similarity" in tokens:
-            return "embedding"
-        else:
-            return "unknown"
 
-    # Function to extract the movie title using Huggingface NER
-    def extract_movie_title(self, question: str) -> str:
-        ner_results = self.ner(question)
-        for entity in ner_results:
-            if entity['entity'] == 'B-MOVIE':  # Assuming NER detects movie titles
-                return entity['word']
-        return ""
+    def build_label_to_entity_dict(self):
+        label_to_entity = {}
+        for entity, label in self.graph.subject_objects(rdflib.RDFS.label):
+            label_str = str(label).lower()
+            label_to_entity[label_str] = entity
+        return label_to_entity
 
-    # Function to generate SPARQL queries for factual questions
-    def generate_sparql_query(self, question: str) -> str:
-        if "director" in question.lower():
-            movie_title = self.extract_movie_title(question)
-            return f"""
-            PREFIX ddis: <http://ddis.ch/atai/>
-            PREFIX wd: <http://www.wikidata.org/entity/>
-            PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-            
-            SELECT ?director WHERE {{
-                ?movie rdfs:label "{movie_title}" .
-                ?movie wdt:P57 ?directorItem .
-                ?directorItem rdfs:label ?director .
-            }}
-            LIMIT 1
-            """
-        elif "screenwriter" in question.lower():
-            movie_title = self.extract_movie_title(question)
-            return f"""
-            PREFIX ddis: <http://ddis.ch/atai/>
-            PREFIX wd: <http://www.wikidata.org/entity/>
-            PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-            
-            SELECT ?screenwriter WHERE {{
-                ?movie rdfs:label "{movie_title}" .
-                ?movie wdt:P58 ?screenwriterItem .
-                ?screenwriterItem rdfs:label ?screenwriter .
-            }}
-            LIMIT 1
-            """
-        return None
+    def build_relation_to_uri_dict(self):
+        with open('relation_mappings.json', 'r', encoding='utf-8') as f:
+            relations = json.load(f)
+        for key in relations:
+            relations[key] = rdflib.URIRef(relations[key])
+        return relations
 
-    # Function to get sentence embeddings using BERT
-    def get_embedding(self, sentence: str):
-        inputs = self.tokenizer(sentence, return_tensors="pt")
-        with torch.no_grad():
-            embeddings = self.model(**inputs)
-        return embeddings.last_hidden_state.mean(dim=1)
+    def load_embeddings(self):
+        entity_emb = np.load('entity_embeds.npy')
+        relation_emb = np.load('relation_embeds.npy')
 
-    # Function to handle embedding-based questions
-    def embedding_based_answer(self, question: str, suggested_answer: str) -> str:
-        question_embedding = self.get_embedding(question)
-        suggested_answer_embedding = self.get_embedding(suggested_answer)
-        
-        # Calculate cosine similarity
-        cosine_similarity = torch.nn.functional.cosine_similarity(question_embedding, suggested_answer_embedding)
-        
-        if cosine_similarity > 0.8:
-            return f"Suggested answer: {suggested_answer} (Embedding Answer)"
-        else:
-            return f"Suggested answer: {suggested_answer} (Embedding Answer, lower confidence)"
+        ent2id = {}
+        id2ent = {}
+        with open('entity_ids.del', 'r') as f:
+            for line in f:
+                idx, entity = line.strip().split('\t')
+                idx = int(idx)
+                ent2id[rdflib.term.URIRef(entity)] = idx
+                id2ent[idx] = rdflib.term.URIRef(entity)
 
-    # Function to handle chatrooms and messages
+        rel2id = {}
+        id2rel = {}
+        with open('relation_ids.del', 'r') as f:
+            for line in f:
+                idx, relation = line.strip().split('\t')
+                idx = int(idx)
+                rel2id[rdflib.term.URIRef(relation)] = idx
+                id2rel[idx] = rdflib.term.URIRef(relation)
+
+        return entity_emb, relation_emb, ent2id, id2ent, rel2id, id2rel
+
     def listen(self):
         while True:
             rooms: List[Chatroom] = self.speakeasy.get_rooms(active=True)
             for room in rooms:
                 if not room.initiated:
-                    room.post_messages(f'Hello! This is a welcome message from {room.my_alias}.')
+                    room.post_messages(f'Hello! You can ask me factual questions about movies.')
                     room.initiated = True
-
-                # Retrieve new messages
                 for message in room.get_messages(only_partner=True, only_new=True):
-                    print(f"New message: '{message.message}'")
-                    
-                    # Classify the question type
-                    question_type = self.classify_question(message.message)
-                    
-                    if question_type == "factual":
-                        # Handle factual questions with SPARQL
-                        sparql_query = self.generate_sparql_query(message.message)
-                        if sparql_query:
-                            result = self.graph.query(sparql_query)
-                            response_message = "Query results:\n"
-                            for row in result:
-                                for item in row:
-                                    if isinstance(item, rdflib.term.Literal):
-                                        response_message += f"{item.value}\n"
-                            room.post_messages(response_message.strip())
-                    elif question_type == "embedding":
-                        # Handle embedding-based questions
-                        embedding_response = self.embedding_based_answer(message.message, "Richard Marquand")
-                        room.post_messages(embedding_response)
+                    print(
+                        f"\t- Chatroom {room.room_id} "
+                        f"- new message #{message.ordinal}: '{message.message}' "
+                        f"- {self.get_time()}")
 
-                    # Mark the message as processed
+                    question = message.message
+                    response = self.process_question(question)
+
+                    room.post_messages(response)
                     room.mark_as_processed(message)
-
             time.sleep(listen_freq)
+
+    def process_question(self, question):
+        doc = self.nlp(question)
+        entities = [
+            (ent.text, ent.label_) for ent in doc.ents
+            if ent.label_ in ['PERSON', 'WORK_OF_ART', 'ORG', 'GPE', 'EVENT', 'PRODUCT']
+        ]
+        relation_label = self.extract_relation_spacy(doc)
+
+        print(f"Extracted entities: {entities}")
+        print(f"Extracted relation: {relation_label}")
+
+        if entities and relation_label:
+            entity_label = entities[0][0]
+            print(f"Entity label: {entity_label}")
+            entity_uri = self.match_entity(entity_label)
+            print(f"Matched entity URI: {entity_uri}")
+            relation_uri = self.match_relation_label(relation_label)
+            print(f"Matched relation URI: {relation_uri}")
+
+            if entity_uri and relation_uri:
+                sparql_query = self.construct_sparql_query(entity_uri, relation_uri)
+                factual_answers = self.execute_sparql_query(sparql_query)
+
+                if not factual_answers:
+                    embedding_answers = self.predict_with_embeddings(entity_uri, relation_uri)
+                else:
+                    embedding_answers = None
+
+                response = self.get_response(entity_label, relation_label, factual_answers, embedding_answers)
+            else:
+                response = f"Sorry, I couldn't find information about '{entity_label}' or understand the relation '{relation_label}'."
+        else:
+            response = f"Sorry, I couldn't understand your question."
+
+        return response
+
+    def extract_relation_spacy(self, doc):
+        possible_relations = set(self.relation_to_uri.keys())
+        with open('verb_to_relation.json', 'r', encoding='utf-8') as f:
+            self.verb_to_relation = json.load(f)
+        with open('question_word_to_relation.json', 'r', encoding='utf-8') as f:
+            self.question_word_to_relation = json.load(f)
+
+        interrogative = None
+        for token in doc:
+            if token.tag_ in ['WP', 'WRB']: 
+                interrogative = token.text.lower()
+                break
+            
+        for token in doc:
+            if token.dep_ == 'attr' and token.lemma_.lower() in possible_relations:
+                return token.lemma_.lower()
+
+        if interrogative:
+            mapping = self.question_word_to_relation.get(interrogative)
+            if mapping:
+                if isinstance(mapping, dict):
+                    for token in doc:
+                        lemma = token.lemma_.lower()
+                        if lemma in mapping:
+                            return mapping[lemma]
+                else:
+                    return mapping
+
+        for token in doc:
+            if token.pos_ == 'VERB':
+                verb_lemma = token.lemma_.lower()
+                if verb_lemma in self.verb_to_relation: 
+                    return self.verb_to_relation[verb_lemma]
+
+        for chunk in doc.noun_chunks:
+            chunk_lemma = chunk.root.lemma_.lower()
+            if chunk_lemma in possible_relations:
+                return chunk_lemma
+
+        return None
+
+
+    def match_entity(self, entity_text):
+        labels = list(self.label_to_entity.keys())
+        matches = difflib.get_close_matches(entity_text.lower(), labels, n=1, cutoff=0.5)
+        if matches:
+            matched_label = matches[0]
+            return self.label_to_entity[matched_label]
+        else:
+            return None
+
+    def match_relation_label(self, relation_label):
+        return self.relation_to_uri.get(relation_label.lower())
+
+    def construct_sparql_query(self, entity_uri, relation_uri):
+        query = f'''
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?answerLabel WHERE {{
+            <{entity_uri}> <{relation_uri}> ?answer .
+            ?answer rdfs:label ?answerLabel .
+            FILTER (lang(?answerLabel) = "en")
+        }}
+        LIMIT 5
+        '''
+        return query
+
+    def execute_sparql_query(self, query):
+        results = self.graph.query(query)
+        answers = [str(row['answerLabel']) for row in results]
+        return answers
+
+    def predict_with_embeddings(self, entity_uri, relation_uri):
+        head_id = self.ent2id.get(entity_uri)
+        rel_id = self.rel2id.get(relation_uri)
+
+        if head_id is None or rel_id is None:
+            return None
+
+        head_vector = self.entity_emb[head_id]
+        rel_vector = self.relation_emb[rel_id]
+
+        tail_vector = head_vector + rel_vector
+        distances = pairwise_distances(tail_vector.reshape(1, -1), self.entity_emb).reshape(-1)
+        closest_ids = distances.argsort()
+        answers = []
+        for idx in closest_ids[:5]:
+            candidate_entity_uri = self.id2ent[idx]
+            label = self.ent2lbl.get(candidate_entity_uri)
+            if label:
+                answers.append(label)
+        return answers
+
+    def get_response(self, entity_label, relation_label, factual_answers, embedding_answers):
+        if factual_answers:
+            answer_str = ', '.join(factual_answers)
+            response = f"The {relation_label} of {entity_label} is {answer_str}."
+        elif embedding_answers:
+            answer_str = ', '.join(embedding_answers)
+            response = f"The answer suggested by embeddings: {answer_str}. (Embedding Answer)"
+        else:
+            response = f"Sorry, I couldn't find any information about the {relation_label} of {entity_label}."
+        return response
 
     @staticmethod
     def get_time():
         return time.strftime("%H:%M:%S, %d-%m-%Y", time.localtime())
 
-
 if __name__ == '__main__':
-    demo_bot = Agent("timid-spirit", "B7uzR8A5")  # Use your own credentials here
-    demo_bot.listen()
+    agent = Agent("timid-spirit", "B7uzR8A5")
+    agent.listen()
