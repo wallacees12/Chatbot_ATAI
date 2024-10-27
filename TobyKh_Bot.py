@@ -154,8 +154,8 @@ class Agent:
             print(f"Matched relation URI: {relation_uri}")
 
             if entity_uri and relation_uri:
-                sparql_query = self.construct_sparql_query(entity_uri, relation_uri)
-                factual_answers = self.execute_sparql_query(sparql_query)
+                sparql_query = self.construct_sparql_query(entity_uri, relation_uri,relation_label)
+                factual_answers = self.execute_sparql_query(sparql_query,relation_label)
 
                 if not factual_answers:
                     embedding_answers = self.predict_with_embeddings(entity_uri, relation_uri)
@@ -224,21 +224,129 @@ class Agent:
     def match_relation_label(self, relation_label):
         return self.relation_to_uri.get(relation_label.lower())
 
-    def construct_sparql_query(self, entity_uri, relation_uri):
-        query = f'''
+    def construct_sparql_query(self, entity_uri, relation_uri, relation_label):
+        
+        # Query to get the director
+        if relation_label == "director":  # Director relation
+            query = f'''
+            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+            PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+            PREFIX wd: <http://www.wikidata.org/entity/>
+            
+            SELECT ?directorLabel WHERE {{
+                <{entity_uri}> <{relation_uri}> ?director .
+                ?director rdfs:label ?directorLabel .
+                FILTER (lang(?directorLabel) = "en")
+            }}
+            LIMIT 5
+            '''
+        # Query to get the publication date
+        elif relation_label == "publication date":  # Publication date relation
+            query = f'''
+            PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+            PREFIX wd: <http://www.wikidata.org/entity/>
+            
+            SELECT ?publicationDate WHERE {{
+                <{entity_uri}> <{relation_uri}> ?publicationDate .
+            }}
+            LIMIT 5
+            '''
+            # Query to get the movie rating
+        elif relation_label == "rating":
+            query = f'''
+            PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+            PREFIX wd: <http://www.wikidata.org/entity/>
+            
+            SELECT ?rating WHERE {{
+                <{entity_uri}> <{relation_uri}> ?rating .
+            }}
+            LIMIT 5
+            '''
+
+        # Query to get the movie genre
+        elif relation_label == "genre":
+            query = f'''
+            PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+            PREFIX wd: <http://www.wikidata.org/entity/>
+            
+            SELECT ?genreLabel WHERE {{
+                <{entity_uri}> <{relation_uri}> ?genre .
+                ?genre rdfs:label ?genreLabel .
+                FILTER (lang(?genreLabel) = "en")
+            }}
+            LIMIT 5
+            '''
+
+        # Query to get the cast of the movie
+        elif relation_label == "cast":
+            query = f'''
+            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+            PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+            PREFIX wd: <http://www.wikidata.org/entity/>
+            
+            SELECT ?actorLabel WHERE {{
+                <{entity_uri}> <{relation_uri}> ?actor .
+                ?actor rdfs:label ?actorLabel .
+                FILTER (lang(?actorLabel) = "en")
+            }}
+            LIMIT 5
+            '''
+
+        elif relation_label == "screenwriter":
+            query = f'''
         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-        SELECT ?answerLabel WHERE {{
-            <{entity_uri}> <{relation_uri}> ?answer .
-            ?answer rdfs:label ?answerLabel .
-            FILTER (lang(?answerLabel) = "en")
+        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+        PREFIX wd: <http://www.wikidata.org/entity/>
+
+        SELECT ?screenwriterLabel WHERE {{
+            <{entity_uri}> wdt:P58 ?screenwriter .  # P58 is the property for screenwriter
+            ?screenwriter rdfs:label ?screenwriterLabel .
+            FILTER (lang(?screenwriterLabel) = "en")
         }}
         LIMIT 5
         '''
+
+        elif relation_label == "cast member":
+            query = f'''
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+        PREFIX wd: <http://www.wikidata.org/entity/>
+
+        SELECT ?castMemberLabel WHERE {{
+            <{entity_uri}> <{relation_uri}> ?castMember .
+            ?castMember rdfs:label ?castMemberLabel .
+            FILTER (lang(?castMemberLabel) = "en")
+        }}
+        LIMIT 5
+        '''
+
+        else:
+            query = ''
+
         return query
 
-    def execute_sparql_query(self, query):
+    def execute_sparql_query(self, query, relation_label):
         results = self.graph.query(query)
-        answers = [str(row['answerLabel']) for row in results]
+        for row in results:
+            print(row)  # Debug output
+
+        # Handle different potential keys based on relation_label
+        if relation_label == 'director':
+            answers = [(str(row['directorLabel'])) for row in results]
+        elif relation_label == 'publication date':
+            answers = [(str(row['publicationDate'])) for row in results]
+        elif relation_label == 'rating':
+            answers = [(str(row['rating'])) for row in results]
+        elif relation_label == 'genre':
+            answers = [(str(row['genreLabel'])) for row in results]
+        elif relation_label == 'cast':
+            answers = [(str(row['actorLabel'])) for row in results]
+        elif relation_label == "screenwriter":
+            answers = [(str(row['screenwriterLabel'])) for row in results]
+        elif relation_label == "cast member":
+            answers = [(str(row['castMemberLabel'])) for row in results]
+        else:
+            answers = []
         return answers
 
     def predict_with_embeddings(self, entity_uri, relation_uri):
