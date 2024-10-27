@@ -128,9 +128,10 @@ class Agent:
 
                     question = message.message
                     response = self.process_question(question)
-
+                    
                     room.post_messages(response)
                     room.mark_as_processed(message)
+                    
             time.sleep(listen_freq)
 
     def process_question(self, question):
@@ -264,10 +265,10 @@ class Agent:
     def get_response(self, entity_label, relation_label, factual_answers, embedding_answers):
         if factual_answers:
             answer_str = ', '.join(factual_answers)
-            response = f"The {relation_label} of {entity_label} is {answer_str}."
+            response = f"The {relation_label} of {entity_label} is {answer_str}.".encode('ascii', errors='replace').decode('ascii')
         elif embedding_answers:
             answer_str = ', '.join(embedding_answers)
-            response = f"The answer suggested by embeddings: {answer_str}. (Embedding Answer)"
+            response = f"The answer suggested by embeddings: {answer_str}. (Embedding Answer)".encode('ascii', errors='replace').decode('ascii')
         else:
             response = f"Sorry, I couldn't find any information about the {relation_label} of {entity_label}."
         return response
