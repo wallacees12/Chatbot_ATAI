@@ -4,3 +4,7 @@ ddis-graph-embeddings.zip
 ddis-movie-graph.nt.zip
 ddis-movie-graph.tsv.zip
 14_graph.nt
+entity_embeds.npy
+relation_embeds.npy
+Test3
+Test3.py

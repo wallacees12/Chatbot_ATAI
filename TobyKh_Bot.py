@@ -166,8 +166,13 @@ class Agent:
             else:
                 response = f"Sorry, I couldn't find information about '{entity_label}' or understand the relation '{relation_label}'."
         else:
-            response = f"Sorry, I couldn't understand your question."
-
+            if entities:
+                entity_label = entities[0][0]
+                response = f"Sorry, I managed to find the entity {entity_label}, but was unable to parse your question, maybe try rephrasing?"
+            if relation_label:
+                response = f"Sorry, I understood your question about {relation_label} but didn't find the film, is it spelt correctly including capitalisation?"
+            else:
+                response =f"Sorry, I didn't quite get that, can you rephrase your question please."
         return response
 
     def extract_relation_spacy(self, doc):
@@ -260,7 +265,7 @@ class Agent:
             SELECT ?rating WHERE {{
                 <{entity_uri}> <{relation_uri}> ?rating .
             }}
-            LIMIT 5
+            LIMIT 1
             '''
 
         # Query to get the movie genre
@@ -274,7 +279,7 @@ class Agent:
                 ?genre rdfs:label ?genreLabel .
                 FILTER (lang(?genreLabel) = "en")
             }}
-            LIMIT 5
+            LIMIT 3
             '''
 
         # Query to get the cast of the movie
@@ -289,7 +294,7 @@ class Agent:
                 ?actor rdfs:label ?actorLabel .
                 FILTER (lang(?actorLabel) = "en")
             }}
-            LIMIT 5
+            LIMIT 10
             '''
 
         elif relation_label == "screenwriter":
@@ -317,11 +322,22 @@ class Agent:
             ?castMember rdfs:label ?castMemberLabel .
             FILTER (lang(?castMemberLabel) = "en")
         }}
-        LIMIT 5
+        LIMIT 15
         '''
 
         else:
-            query = ''
+            query = f'''
+            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+            PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+            PREFIX wd: <http://www.wikidata.org/entity/>
+            
+            SELECT ?valueLabel WHERE {{
+                <{entity_uri}> <{relation_uri}> ?value .
+                ?value rdfs:label ?valueLabel .
+                FILTER (lang(?valueLabel) = "en")
+            }}
+            LIMIT 5
+            ''' 
 
         return query
 
@@ -346,7 +362,7 @@ class Agent:
         elif relation_label == "cast member":
             answers = [(str(row['castMemberLabel'])) for row in results]
         else:
-            answers = []
+            answers = [(str(row['valueLabel'])) for row in results]
         return answers
 
     def predict_with_embeddings(self, entity_uri, relation_uri):
@@ -363,7 +379,7 @@ class Agent:
         distances = pairwise_distances(tail_vector.reshape(1, -1), self.entity_emb).reshape(-1)
         closest_ids = distances.argsort()
         answers = []
-        for idx in closest_ids[:5]:
+        for idx in closest_ids[:3]:
             candidate_entity_uri = self.id2ent[idx]
             label = self.ent2lbl.get(candidate_entity_uri)
             if label:
@@ -373,10 +389,19 @@ class Agent:
     def get_response(self, entity_label, relation_label, factual_answers, embedding_answers):
         if factual_answers:
             answer_str = ', '.join(factual_answers)
-            response = f"The {relation_label} of {entity_label} is {answer_str}.".encode('ascii', errors='replace').decode('ascii')
+            response = (
+            f"The {relation_label} for {entity_label} is: {answer_str}.\n(Factual Answer)"
+            ).encode('ascii', errors='replace').decode('ascii')
         elif embedding_answers:
-            answer_str = ', '.join(embedding_answers)
-            response = f"The answer suggested by embeddings: {answer_str}. (Embedding Answer)".encode('ascii', errors='replace').decode('ascii')
+            answer_str = (
+            f"Our top pick is {embedding_answers[0]},\n "
+            f"But it could also be {embedding_answers[1]}\n "
+            f"Or perhaps {embedding_answers[2]}."
+            )
+            response = (
+            f"We couldn't find the {relation_label} information for {entity_label} in our knowledge graph.\n\n"
+            f"However, based on our embeddings:\n {answer_str}.\n (Embedding Answer)"
+            ).encode('ascii', errors='replace').decode('ascii')
         else:
             response = f"Sorry, I couldn't find any information about the {relation_label} of {entity_label}."
         return response
