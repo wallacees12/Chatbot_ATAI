@@ -120,7 +120,7 @@ Hello! You can ask me factual questions about movies.
         "find movies similar to", "find films like", "find something like",
         "looking for movies like", "looking for films like", "find movies similar to",
         "show me movies like", "show me films like", "give me movies similar to",
-        "any movies similar to", "any films similar to",
+        "any movies similar to", "any films similar to", "something like",
         "recommend based on", "movies along the lines of",
         "I like movies like", "I love movies like", "films that remind me of",
         "suggest films that are like", "suggest movies that are like",
