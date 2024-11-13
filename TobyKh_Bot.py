@@ -280,7 +280,7 @@ Hello! You can ask me factual questions about movies.
 
                     # Process the question
                     question = message.message
-                    print(f"{Fore.YELLOW}[PROCESSING BACKGROUND]{Style.RESET_ALL}")
+                    print(f"{Fore.YELLOW}[BACKGROUND PROCESSING]{Style.RESET_ALL}")
                     response = self.process_question(question)
                     print("...processing complete.\n")
 
