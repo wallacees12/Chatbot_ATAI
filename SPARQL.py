@@ -1,16 +1,21 @@
 import rdflib
+from functools import lru_cache
 
 class KnowledgeGraphQuery:
     def __init__(self, graph_path):
         # Load the knowledge graph
         self.graph = rdflib.Graph()
-        self.graph.parse(graph_path, format="turtle")
-        print(f"Loaded graph with {len(self.graph)} triples.")
+        try:
+            self.graph.parse(graph_path, format="turtle")
+            print(f"Loaded graph with {len(self.graph)} triples.")
+        except Exception as e:
+            print(f"[ERROR] Failed to load graph: {e}")
 
     def get_movies_by_genre(self, genre):
-        """
-        SPARQL query to retrieve movies that belong to a specific genre.
-        """
+        """Retrieve movies in a specific genre."""
+        if not genre:
+            print("[ERROR] Genre cannot be empty.")
+            return []
         query = f"""
         PREFIX wdt: <http://www.wikidata.org/prop/direct/>
         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -23,15 +28,19 @@ class KnowledgeGraphQuery:
         }}
         LIMIT 50
         """
-        results = self.graph.query(query)
-        movies = [str(row.movieLabel) for row in results]
-        return movies
+        try:
+            results = self.graph.query(query)
+            return [str(row.movieLabel) for row in results]
+        except Exception as e:
+            print(f"[ERROR] Failed to retrieve movies by genre '{genre}': {e}")
+            return []
 
     def get_movies_by_era(self, era):
-        """
-        SPARQL query to retrieve movies released in a specific era (e.g., 1980s).
-        """
+        """Retrieve movies released in a specific era."""
         start_year, end_year = self.parse_era(era)
+        if not start_year or not end_year:
+            print(f"[ERROR] Invalid era: {era}")
+            return []
         query = f"""
         PREFIX wdt: <http://www.wikidata.org/prop/direct/>
         
@@ -43,15 +52,22 @@ class KnowledgeGraphQuery:
         }}
         LIMIT 50
         """
-        results = self.graph.query(query)
-        movies = [str(row.movieLabel) for row in results]
-        return movies
+        try:
+            results = self.graph.query(query)
+            return [str(row.movieLabel) for row in results]
+        except Exception as e:
+            print(f"[ERROR] Failed to retrieve movies for era '{era}': {e}")
+            return []
 
     def get_movies_by_genre_and_era(self, genre, era):
-        """
-        SPARQL query to retrieve movies with a specific genre and release year range.
-        """
+        """Retrieve movies by genre and era."""
         start_year, end_year = self.parse_era(era)
+        if not start_year or not end_year:
+            print(f"[ERROR] Invalid era: {era}")
+            return []
+        if not genre:
+            print("[ERROR] Genre cannot be empty.")
+            return []
         query = f"""
         PREFIX wdt: <http://www.wikidata.org/prop/direct/>
         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -66,24 +82,28 @@ class KnowledgeGraphQuery:
         }}
         LIMIT 50
         """
-        results = self.graph.query(query)
-        movies = [str(row.movieLabel) for row in results]
-        return movies
+        try:
+            results = self.graph.query(query)
+            return [str(row.movieLabel) for row in results]
+        except Exception as e:
+            print(f"[ERROR] Failed to retrieve movies by genre '{genre}' and era '{era}': {e}")
+            return []
 
     def parse_era(self, era):
-        """
-        Helper function to convert an era (e.g., "1980s") into a start and end year.
-        """
-        if era.endswith("s"):
-            start_year = int(era[:-1])
-            end_year = start_year + 9
-            return start_year, end_year
-        return int(era), int(era)  # Single year if no "s" suffix
+        """Convert an era into a start and end year."""
+        try:
+            if era.endswith("s"):
+                start_year = int(era[:-1])
+                end_year = start_year + 9
+                return start_year, end_year
+            return int(era), int(era)
+        except ValueError:
+            print(f"[ERROR] Invalid era format: {era}")
+            return None, None
 
+    @lru_cache(maxsize=128)
     def list_genres(self):
-        """
-        SPARQL query to retrieve all unique genres in the knowledge graph.
-        """
+        """Retrieve all unique genres in the knowledge graph."""
         query = """
         PREFIX wdt: <http://www.wikidata.org/prop/direct/>
         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -95,9 +115,13 @@ class KnowledgeGraphQuery:
         }
         ORDER BY ?genreLabel
         """
-        results = self.graph.query(query)
-        genres = [str(row.genreLabel) for row in results]
-        return genres
+        try:
+            results = self.graph.query(query)
+            return [str(row.genreLabel) for row in results]
+        except Exception as e:
+            print(f"[ERROR] Failed to list genres: {e}")
+            return []
+
 
 # Initialize the KnowledgeGraphQuery with the path to the .nt file
 kg_query = KnowledgeGraphQuery("14_graph.nt")

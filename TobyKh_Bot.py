@@ -120,7 +120,7 @@ Hello! You can ask me factual questions about movies.
         "find movies similar to", "find films like", "find something like",
         "looking for movies like", "looking for films like", "find movies similar to",
         "show me movies like", "show me films like", "give me movies similar to",
-        "any movies similar to", "any films similar to", "something like",
+        "any movies similar to", "any films similar to",
         "recommend based on", "movies along the lines of",
         "I like movies like", "I love movies like", "films that remind me of",
         "suggest films that are like", "suggest movies that are like",
@@ -280,7 +280,7 @@ Hello! You can ask me factual questions about movies.
 
                     # Process the question
                     question = message.message
-                    print(f"{Fore.YELLOW}[BACKGROUND PROCESSING]{Style.RESET_ALL}")
+                    print(f"{Fore.YELLOW}[PROCESSING BACKGROUND]{Style.RESET_ALL}")
                     response = self.process_question(question)
                     print("...processing complete.\n")
 
@@ -297,8 +297,16 @@ Hello! You can ask me factual questions about movies.
 
     def process_question(self, question):
         doc = self.nlp(question)
+        
+        info = self.extract_entites(question)
+        print(info)
+        
+        if info['eras'] and not info['movie_titles']:
+            recommendations = self.get_movies_by_era(info['eras'])
+            response = self.format_reccomendations(recommendations)
 
-
+            return response
+        
         if self.is_reccomendation_request(question):
             info = self.extract_entites(question) 
             print(self.extract_entites(question))
@@ -384,33 +392,100 @@ Hello! You can ask me factual questions about movies.
                 return chunk_lemma
 
         return None
+    def get_movie_genre(self, movie_uri):
+        """
+        Retrieve the genre(s) of a movie from the RDF graph using its URI.
+        """
+        query = f"""
+        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        
+        SELECT ?genreLabel WHERE {{
+            <{movie_uri}> wdt:P136 ?genre .
+            ?genre rdfs:label ?genreLabel .
+            FILTER (lang(?genreLabel) = "en")
+        }}
+        """
+        try:
+            results = self.graph.query(query)
+            genres = [str(row['genreLabel']) for row in results]
+            return genres
+        except Exception as e:
+            print(f"Error retrieving genres for {movie_uri}: {e}")
+            return []
+
+    def get_movie_year(self, movie_uri):
+        """
+        Retrieve the release year of a movie from the RDF graph using its URI.
+        """
+        query = f"""
+        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        
+        SELECT ?year WHERE {{
+            <{movie_uri}> wdt:P577 ?date .
+            BIND(YEAR(?date) AS ?year)
+        }}
+        LIMIT 1
+        """
+        try:
+            results = self.graph.query(query)
+            for row in results:
+                return int(row['year'])
+        except Exception as e:
+            print(f"Error retrieving year for {movie_uri}: {e}")
+            return None
 
     def extract_entites(self, question):
-
         doc = self.nlp(question)
 
+        # Extract movie titles from named entities
         movie_titles = [ent.text for ent in doc.ents if ent.label_ == "WORK_OF_ART"]
-        genres = []
-        eras = []
 
-        # Simple keyword matching for genres and eras
+        # Load genre and era keywords
         with open("genres.txt", 'r') as file:
-            genre_keywords = [line.strip() for line in file.readlines()]
-        
-        era_keywords = ["1970s", "1980s", "1990s","2000s","2010s","2020s","1970","1980","1990","2000","2010","2020","1950","1950s",
-        "1950s","1940","1940s","1930","1930s","1920s","1920","1960","1960s" "classic", "old", "retro"]
+            genre_keywords = {line.strip().lower() for line in file}
 
-        for token in doc:
-            if token.text.lower() in genre_keywords:
-                genres.append(token.text.lower())
-            if token.text.lower() in era_keywords:
-                eras.append(token.text.lower())
+        era_keywords = {
+            "1970s", "1980s", "1990s", "2000s", "2010s", "2020s",
+            "classic", "old", "retro",
+            "70s", "80s", "90s", "twentieth century"
+        }
+
+        # Extract genres
+        genres = {token.text.lower() for token in doc if token.text.lower() in genre_keywords}
+
+        # Extract explicit eras from era keywords
+        detected_eras = {token.text.lower() for token in doc if token.text.lower() in era_keywords}
+
+        # Infer eras based on movie titles' release years
+        inferred_eras = [
+            self.get_movie_year(self.match_entity(title))
+            for title in movie_titles
+            if self.match_entity(title) and self.get_movie_year(self.match_entity(title)) is not None
+        ]
+        inferred_eras = set(
+            f"{int(year) // 10 * 10}s"
+            for year in inferred_eras
+            if year is not None
+        )
+
+        # Combine detected and inferred eras
+        eras = detected_eras.union(inferred_eras)
+
+        # Debugging logs
+        if not (movie_titles or genres or eras):
+            print(f"[DEBUG] No entities extracted for question: {question}")
+
+        print(f"Extracted entities: {movie_titles}, genres: {genres}, eras: {eras}")
 
         return {
             "movie_titles": movie_titles,
-            "genres": genres,
-            "eras": eras
+            "genres": list(genres),
+            "eras": list(eras)
         }
+
+
 
 
     def match_entity(self, entity_text):
@@ -427,28 +502,38 @@ Hello! You can ask me factual questions about movies.
 
     from collections import Counter
 
+    def is_horror_movie(self, movie_uri):
+        """
+        Check if the movie belongs to the horror genre.
+        """
+        genres = self.get_movie_genre(movie_uri)
+        return "Horror" in genres
+
     def get_recommendations(self, movie_titles, num_recommendations=5, genre=None, era=None):
         all_recommendations = []
 
-        # Loop through each movie title provided by the user
+        # If era is a list, extract the first value for processing
+        if isinstance(era, list) and len(era) > 0:
+            era = era[0]  # Use the first era for filtering
+        elif isinstance(era, list):
+            era = None  # Set to None if the list is empty
+
         if movie_titles:
             for movie_title in movie_titles:
                 movie_uri = self.match_entity(movie_title)
-                if movie_uri is None:
-                    continue  # Skip if the movie title is not recognized
+                if not movie_uri:
+                    print(f"Movie '{movie_title}' not recognized. Skipping.")
+                    continue
 
                 movie_id = self.ent2id.get(movie_uri)
                 if movie_id is None:
-                    continue  # Skip if no embedding is available for this movie
+                    print(f"Embeddings not found for '{movie_title}'. Skipping.")
+                    continue
 
-                # Calculate similarity between the target movie embedding and all other movie embeddings
                 target_embedding = self.entity_emb[movie_id].reshape(1, -1)
                 similarities = cosine_similarity(target_embedding, self.entity_emb).flatten()
 
-                # Get the indices of the most similar movies, excluding the target movie itself
-                similar_indices = np.argsort(-similarities)[1:]
-
-                # Filter recommendations by genre and era, if specified
+                similar_indices = np.argsort(-similarities)[1:]  # Exclude the movie itself
                 for idx in similar_indices:
                     similar_movie_uri = self.id2ent[idx]
                     similar_movie_title = self.ent2lbl.get(similar_movie_uri)
@@ -456,42 +541,63 @@ Hello! You can ask me factual questions about movies.
                     # Skip if no title is found
                     if not similar_movie_title:
                         continue
-                    
-                    # Optional: Check genre and era filters
-                    if genre and genre not in self.get_movie_genre(similar_movie_uri):
-                        continue
-                    if era and era not in str(self.get_movie_year(similar_movie_uri)):
-                        continue
-                    
-                    all_recommendations.append(similar_movie_title)
-                    
-                    # Stop if we reach a certain number of recommendations for each movie
-                    if len(all_recommendations) >= num_recommendations * len(movie_titles) * 4:
-                        break
-        elif genre and era:
-            # Get recommendations based on both genre and era
-            all_recommendations = self.get_movies_by_genre_and_era(genre, era)
-            if all_recommendations == []:
-                print(f"No results found for '{genre}' in era '{era}'. Expanding to include related subgenres.")
-                all_recommendations = self.get_movies_by_broadgenre_era(genre,era)
-        elif genre:
-            # Get recommendations based on genre only
-            print(f"Looking for films with genre {genre}")
-            all_recommendations = self.get_movies_by_genre(genre)
-            if all_recommendations == []:
-                print(f"No results found for '{genre}'. Expanding to include related subgenres.")
-                all_recommendations = self.get_movies_by_broad(genre)
-        elif era:
-            # Get recommendations based on era only
-            all_recommendations = self.get_movies_by_era(era)
 
-        # Rank and prioritize recommendations that appear multiple times
+                    # Retrieve genres for the similar movie
+                    genres = self.get_movie_genre(similar_movie_uri) or []
+
+                    # Convert genres to lowercase for case-insensitive comparison
+                    genres_lower = [genre.lower() for genre in genres]
+
+                    # Exclude movies classified as documentaries
+                    if "documentary" in genres_lower:
+                        print(f"Excluding {similar_movie_title} (documentary).")
+                        continue
+
+                    # Filter recommendations based on genre
+                    if genre and genre.lower() not in genres_lower:
+                        continue
+
+                    # Filter recommendations based on era
+                    if era and not self.is_within_era(similar_movie_uri, era):
+                        continue
+
+                    # Add valid recommendations
+                    all_recommendations.append(similar_movie_title)
+
+                    # Stop if we've gathered enough recommendations
+                    if len(all_recommendations) >= num_recommendations * len(movie_titles):
+                        break
+
+        else:
+            # Handle recommendations based only on genre and/or era
+            if genre and era:
+                all_recommendations = self.get_movies_by_genre_and_era(genre, era)
+            elif genre:
+                all_recommendations = self.get_movies_by_genre(genre)
+            elif era:
+                all_recommendations = self.get_movies_by_era(era)
+
+        # Deduplicate and rank recommendations for diversity
         ranked_recommendations = Counter(all_recommendations)
         sorted_recommendations = [title for title, _ in ranked_recommendations.most_common(num_recommendations)]
         final_recommendations = [movie for movie in sorted_recommendations if movie not in movie_titles]
 
-        print(final_recommendations[:num_recommendations])
+        print(f"Final Recommendations: {final_recommendations[:num_recommendations]}")
         return final_recommendations[:num_recommendations]
+
+
+    def is_within_era(self, movie_uri, era):
+        # Parse era into start and end year
+        start_year, end_year = self.parse_era([era])[0]
+        
+        # Retrieve the movie's release year
+        movie_year = self.get_movie_year(movie_uri)
+        if not movie_year:
+            return False
+
+        # Check if the movie falls within the specified era
+        return start_year <= movie_year <= end_year
+
 
     def construct_sparql_query(self, entity_uri, relation_uri, relation_label):
         
@@ -679,8 +785,10 @@ Hello! You can ask me factual questions about movies.
         for idx, movie_title in enumerate(recommendations, start=1):
             formatted_recommendations += f"{idx}. {movie_title}\n"
 
+        formatted_recommendations += "\nThese recommendations are based on the movies you like."
         formatted_recommendations += "\nHappy watching!"
         return formatted_recommendations
+
 
    
     def get_subgenres(self, genre_keywords):
@@ -696,23 +804,26 @@ Hello! You can ask me factual questions about movies.
         except FileNotFoundError:
             print("Error: 'genres.txt' file not found.")
             return []
-
+        
         # Ensure genre_keywords is a list (even if a single keyword is passed)
         if isinstance(genre_keywords, str):
             genre_keywords = [genre_keywords]
-
+        
         # Filter genres to find subgenres containing any keyword in genre_keywords
         subgenres = [
             genre for genre in genres 
             if any(keyword.lower() in genre.lower() for keyword in genre_keywords)
         ]
         print(f"Found all the subgenres {subgenres}")
+        if not subgenres:
+            print(f"No subgenres found for keywords: {genre_keywords}")
+            
         return subgenres
 
 
     def get_movies_by_genre(self, genre):
         """
-        SPARQL query to retrieve movies that belong to a specific genre.
+        SPARQL query to retrieve movies belonging to a specific genre.
         """
         query = f"""
         PREFIX wdt: <http://www.wikidata.org/prop/direct/>
@@ -726,19 +837,29 @@ Hello! You can ask me factual questions about movies.
         }}
         LIMIT 50
         """
-        results = self.graph.query(query)
-        print(results)
-        movies = [str(row.movieLabel) for row in results]
+        try:
+            results = self.graph.query(query)
+            movies = [str(row.movieLabel) for row in results]
+        except Exception as e:
+            print(f"Error retrieving movies by genre '{genre}': {e}")
+            return []
+
+        if not movies:
+            print(f"No movies found for genre: {genre}")
+            return []
         return movies
+
 
     def get_movies_by_era(self, eras):
         """
-        SPARQL query to retrieve movies released in any of the specified eras (e.g., ["1980s", "1990"]).
+        SPARQL query to retrieve movies released within specified eras.
         """
-        # Parse the list of eras to get a list of (start_year, end_year) tuples
         parsed_eras = self.parse_era(eras)
-        
-        # Build the FILTER clause to match any of the specified eras
+        if not parsed_eras:
+            print(f"[DEBUG] No valid eras found in: {eras}")
+            return []
+
+        # Build the FILTER clause
         era_filters = " || ".join(
             f"(YEAR(?date) >= {start} && YEAR(?date) <= {end})" for start, end in parsed_eras
         )
@@ -756,14 +877,23 @@ Hello! You can ask me factual questions about movies.
         }}
         LIMIT 50
         """
-        
-        # Execute the query
-        results = self.graph.query(query)
-        movies = [str(row.movieLabel) for row in results]
+        try:
+            results = self.graph.query(query)
+            movies = [str(row.movieLabel) for row in results]
+        except Exception as e:
+            print(f"Error retrieving movies for eras {eras}: {e}")
+            return []
+
+        if not movies:
+            print(f"No movies found for eras: {eras}")
+            return []
         return movies
+
+
+    
     def get_movies_by_genre_and_era(self, genre, era):
         """
-        SPARQL query to retrieve movies with a specific genre and release year range.
+        SPARQL query to retrieve movies filtered by genre and release year range.
         """
         start_year, end_year = self.parse_era(era)
         query = f"""
@@ -773,7 +903,7 @@ Hello! You can ask me factual questions about movies.
 
         SELECT ?movieLabel WHERE {{
             ?movie wdt:P136 ?genre ;
-                   wdt:P577 ?date .
+                wdt:P577 ?date .
             ?genre rdfs:label "{genre}"@en .
             FILTER (YEAR(?date) >= {start_year} && YEAR(?date) <= {end_year}) .
             ?movie rdfs:label ?movieLabel .
@@ -781,9 +911,18 @@ Hello! You can ask me factual questions about movies.
         }}
         LIMIT 50
         """
-        results = self.graph.query(query)
-        movies = [str(row.movieLabel) for row in results]
+        try:
+            results = self.graph.query(query)
+            movies = [str(row.movieLabel) for row in results]
+        except Exception as e:
+            print(f"Error retrieving movies for genre '{genre}' and era '{era}': {e}")
+            return []
+
+        if not movies:
+            print(f"No movies found for genre '{genre}' in era '{era}'")
+            return []
         return movies
+
 
     def get_movies_by_broadgenre_era(self, broad_genre, era):
         """
@@ -839,25 +978,35 @@ Hello! You can ask me factual questions about movies.
         results = self.graph.query(query)
         movies = [str(row.movieLabel) for row in results]
         return movies
+    
     def parse_era(self, eras):
         """
-        Helper function to convert a list of eras (e.g., ["1980s", "1990s", "1985"]) 
-        into a list of tuples with start and end years.
+        Convert a list of eras (e.g., ["1980s", "1990s", "1985"]) into tuples of start and end years.
         """
         parsed_eras = []
         
         for era in eras:
+            era = era.strip()  # Remove whitespace
+            if not era or len(era) < 2:  # Skip invalid entries
+                print(f"[DEBUG] Invalid era format: '{era}'")
+                continue
+
             # Check if the era is a decade (e.g., "1980s")
-            if era.endswith("s"):
+            if era.endswith("s") and era[:-1].isdigit():
                 start_year = int(era[:-1])
                 end_year = start_year + 9
                 parsed_eras.append((start_year, end_year))
-            else:
-                # Treat as a single year if no "s" suffix
+            elif era.isdigit():  # Single year (e.g., "1985")
                 year = int(era)
                 parsed_eras.append((year, year))
-        
+            else:
+                print(f"[DEBUG] Invalid era format: '{era}'")
+
         return parsed_eras
+
+
+
+
 
     @staticmethod
     def get_time():
