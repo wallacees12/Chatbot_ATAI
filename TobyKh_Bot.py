@@ -1333,7 +1333,6 @@ Hello! You can ask me factual questions about movies.
             "who directed",
             "who starred in"
         ]
-        
         # Try to match the question with one of the patterns
         for pattern in question_patterns:
             if question.startswith(pattern):
