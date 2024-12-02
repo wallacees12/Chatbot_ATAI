@@ -13,9 +13,22 @@ from collections import Counter
 from sklearn.metrics.pairwise import cosine_similarity
 from colorama import Fore, Style  # For colored console output
 import json
+import torch
+from torchvision.io import read_image
+from torchvision.models import resnet18, ResNet18_Weights
+import matplotlib.pyplot as plt
+from PIL import Image
+import requests
+from io import BytesIO
+import csv
+
 
 DEFAULT_HOST_URL = 'https://speakeasy.ifi.uzh.ch'
 listen_freq = 2
+os.environ["OMP_NUM_THREADS"] = "1"
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+device = torch.device("cpu")
 
 class Agent:
     def __init__(self, username, password):
@@ -41,7 +54,9 @@ class Agent:
         self.graph.parse('14_graph.nt', format='turtle')
         graph_time = timeit.default_timer() - graph_start
         print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Graph loading and parsing time: {graph_time:.4f} seconds")
-
+        
+        self.crowd_data = self.load_crowd_data("crowd_data.tsv")
+        
         # Build dictionaries for labels, entities, and relations
         label_to_entity_start = timeit.default_timer()
         self.label_to_entity = self.build_label_to_entity_dict()
@@ -62,7 +77,12 @@ class Agent:
         self.nlp = self.add_movie_title_patterns(self.nlp)
         nlp_time = timeit.default_timer() - nlp_start
         print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} spaCy model loading and movie title patterns setup time: {nlp_time:.4f} seconds")
-
+        
+        self.model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        self.model.eval()
+        self.model = torch.nn.Sequential(*list(self.model.children())[:-1])
+        self.preprocess = ResNet18_Weights.DEFAULT.transforms()
+        
         # Print total initialization time
         init_time = timeit.default_timer() - init_start
         print("="*40)
@@ -296,23 +316,55 @@ Hello! You can ask me factual questions about movies.
 
 
     def process_question(self, question):
-        doc = self.nlp(question)
-        
-        info = self.extract_entites(question)
-        print(info)
-        
-        if info['eras'] and not info['movie_titles']:
-            recommendations = self.get_movies_by_era(info['eras'])
-            response = self.format_reccomendations(recommendations)
+        """
+        Process a user's question and determine the appropriate response.
+        """
+        # Normalize the question for easier matching
+        normalized_question = question.lower().strip().rstrip(".!?")
 
-            return response
-        
+        # Use the NLP model to extract entities and additional information
+        doc = self.nlp(question)
+        info = self.extract_entities(question)
+        print(info)
+
+        # Extract relevant details
+        movie_titles = info.get('movie_titles', [])
+        cast_names = info.get('cast_names', [])
+        entity_label = movie_titles[0] if movie_titles else (cast_names[0] if cast_names else None)
+
+        # Handle multimedia-related questions
+        multimedia_phrases = {
+            "show me", "look like", "let me know what", "can you show", 
+            "picture of", "image of", "appearance of", "frame of", "frames of", "scene of"
+        }
+
+        if any(phrase in normalized_question for phrase in multimedia_phrases):
+            if "frames" in normalized_question:
+                if entity_label:
+                    return self.answer_movie_frames_question(entity_label)
+                return "Sorry, I couldn't identify the movie you're asking about."
+            if entity_label:
+                return self.answer_multimedia_question(entity_label)
+            return "Sorry, I couldn't find the person or movie you're referring to. Could you clarify?"
+
+        # Handle recommendation questions
+        if info['eras'] and not movie_titles:
+            recommendations = self.get_movies_by_era(info['eras'])
+            return self.format_reccomendations(recommendations)
+
         if self.is_reccomendation_request(question):
-            info = self.extract_entites(question) 
-            print(self.extract_entites(question))
-            recommendations = self.get_recommendations(info['movie_titles'], num_recommendations=5,genre = info['genres'], era = info['eras'])
-            response = self.format_reccomendations(recommendations)
-            return response
+            print(f"[DEBUG] Extracted recommendation info: {info}")
+            recommendations = self.get_recommendations(
+                movie_titles, num_recommendations=5, genre=info['genres'], era=info['eras']
+            )
+            return self.format_reccomendations(recommendations)
+
+        # Handle crowdsourcing-related questions
+        if "box office" in normalized_question or "publication date" in normalized_question or "executive producer" in normalized_question:
+            # Handle crowdsourcing questions related to movie data
+            return self.answer_crowdsourcing_question(question)
+
+        # Extract entities and relations
         entities = [
             (ent.text, ent.label_) for ent in doc.ents
             if ent.label_ in ['PERSON', 'WORK_OF_ART', 'ORG', 'GPE', 'EVENT', 'PRODUCT']
@@ -322,8 +374,9 @@ Hello! You can ask me factual questions about movies.
         print(f"Extracted entities: {entities}")
         print(f"Extracted relation: {relation_label}")
 
+        # Handle factual or embedding questions
         if entities and relation_label:
-            entity_label = entities[0][0]
+            entity_label = entities[0][0]  # Take the first extracted entity
             print(f"Entity label: {entity_label}")
             entity_uri = self.match_entity(entity_label)
             print(f"Matched entity URI: {entity_uri}")
@@ -331,26 +384,30 @@ Hello! You can ask me factual questions about movies.
             print(f"Matched relation URI: {relation_uri}")
 
             if entity_uri and relation_uri:
-                sparql_query = self.construct_sparql_query(entity_uri, relation_uri,relation_label)
-                factual_answers = self.execute_sparql_query(sparql_query,relation_label)
+                sparql_query = self.construct_sparql_query(entity_uri, relation_uri, relation_label)
+                factual_answers = self.execute_sparql_query(sparql_query, relation_label)
 
                 if not factual_answers:
                     embedding_answers = self.predict_with_embeddings(entity_uri, relation_uri)
                 else:
                     embedding_answers = None
 
-                response = self.get_response(entity_label, relation_label, factual_answers, embedding_answers)
-            else:
-                response = f"Sorry, I couldn't find information about '{entity_label}' or understand the relation '{relation_label}'."
-        else:
-            if entities:
-                entity_label = entities[0][0]
-                response = f"Sorry, I managed to find the entity {entity_label}, but was unable to parse your question, maybe try rephrasing?"
-            if relation_label:
-                response = f"Sorry, I understood your question about {relation_label} but didn't find the film, is it spelt correctly including capitalisation?"
-            else:
-                response =f"Sorry, I didn't quite get that, can you rephrase your question please."
-        return response
+                return self.get_response(entity_label, relation_label, factual_answers, embedding_answers)
+
+            return f"Sorry, I couldn't find information about '{entity_label}' or understand the relation '{relation_label}'."
+
+        # Handle cases with partial information
+        if entities:
+            entity_label = entities[0][0]
+            return f"Sorry, I managed to find the entity '{entity_label}', but was unable to parse your question. Could you try rephrasing?"
+
+        if relation_label:
+            return f"Sorry, I understood your question about '{relation_label}' but couldn't find the film. Is it spelled correctly?"
+
+        # Fallback response for unrecognized questions
+        return "Sorry, I didn't quite get that. Can you rephrase your question, please?"
+
+
 
     def extract_relation_spacy(self, doc):
         possible_relations = set(self.relation_to_uri.keys())
@@ -392,6 +449,14 @@ Hello! You can ask me factual questions about movies.
                 return chunk_lemma
 
         return None
+    def is_crowdsourcing_question(self, question):
+        """
+        Determine if the question relates to crowdsourcing topics like revenue, box office, etc.
+        """
+        crowdsourcing_keywords = ["box office", "votes", "crowdsourcing", "revenue", "publication date", "producer", "director"]
+        # You could expand the list to include other keywords as needed.
+        return any(keyword in question.lower() for keyword in crowdsourcing_keywords)
+
     def get_movie_genre(self, movie_uri):
         """
         Retrieve the genre(s) of a movie from the RDF graph using its URI.
@@ -436,16 +501,23 @@ Hello! You can ask me factual questions about movies.
             print(f"Error retrieving year for {movie_uri}: {e}")
             return None
 
-    def extract_entites(self, question):
+    def extract_entities(self, question):
+        """
+        Extracts entities like movie titles, cast names, genres, and eras from the question.
+        """
         doc = self.nlp(question)
 
         # Extract movie titles from named entities
         movie_titles = [ent.text for ent in doc.ents if ent.label_ == "WORK_OF_ART"]
 
-        # Load genre and era keywords
+        # Extract cast names (actors/actresses)
+        cast_names = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
+
+        # Load genre keywords
         with open("genres.txt", 'r') as file:
             genre_keywords = {line.strip().lower() for line in file}
 
+        # Define era keywords
         era_keywords = {
             "1970s", "1980s", "1990s", "2000s", "2010s", "2020s",
             "classic", "old", "retro",
@@ -474,16 +546,19 @@ Hello! You can ask me factual questions about movies.
         eras = detected_eras.union(inferred_eras)
 
         # Debugging logs
-        if not (movie_titles or genres or eras):
+        if not (movie_titles or cast_names or genres or eras):
             print(f"[DEBUG] No entities extracted for question: {question}")
 
-        print(f"Extracted entities: {movie_titles}, genres: {genres}, eras: {eras}")
+        print(f"Extracted entities: Movie Titles: {movie_titles}, Cast Names: {cast_names}, Genres: {genres}, Eras: {eras}")
 
+        # Return all extracted entities
         return {
             "movie_titles": movie_titles,
+            "cast_names": cast_names,
             "genres": list(genres),
             "eras": list(eras)
         }
+
 
 
 
@@ -890,7 +965,7 @@ Hello! You can ask me factual questions about movies.
         return movies
 
 
-    
+   
     def get_movies_by_genre_and_era(self, genre, era):
         """
         SPARQL query to retrieve movies filtered by genre and release year range.
@@ -978,36 +1053,298 @@ Hello! You can ask me factual questions about movies.
         results = self.graph.query(query)
         movies = [str(row.movieLabel) for row in results]
         return movies
-    
-    def parse_era(self, eras):
+
+    def preprocess_image(self, image_path):
         """
-        Convert a list of eras (e.g., ["1980s", "1990s", "1985"]) into tuples of start and end years.
+        Preprocess the input image for ResNet model.
         """
-        parsed_eras = []
+        original_img = read_image(image_path)
+        preprocess_img = self.preprocess(original_img)  # Assumes self.preprocess() is defined elsewhere
+        return original_img, preprocess_img.unsqueeze(0)
+
+    def generate_image_response(self, image_path, entity_label):
+        """
+        Generate an HTML-compatible response with the image and ResNet visualization.
+        """
+
+        try:
+            original_img, preprocess_img = self.preprocess_image(image_path)
+            embedding = self.model(preprocess_img).detach().numpy().reshape(32, 64)
+
+            # Create a figure to visualize the image and embedding
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+            ax1.imshow(original_img.permute(1, 2, 0).numpy().astype('uint8'))
+            ax1.set_title(entity_label)
+            ax2.imshow(embedding, cmap='viridis')
+            ax2.set_title("Embedding Visualization")
+
+            # Convert the figure to a base64 image
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png')
+            buf.seek(0)
+            encoded_image = base64.b64encode(buf.read()).decode('utf-8')
+            buf.close()
+
+            # HTML response with embedded base64 image
+            html_response = f"""
+            <div>
+                <h3>Image of {entity_label}</h3>
+                <img src="data:image/png;base64,{encoded_image}" alt="Image of {entity_label}" />
+            </div>
+            """
+            return html_response
+        except Exception as e:
+            return f"Sorry, an error occurred while processing the image: {str(e)}"
+
+    def answer_multimedia_question(self, entity_label):
+        """
+        Retrieves a single image (including frames) for a cast member based on their name or IMDb ID,
+        displays it, and includes the link in the chat response.
+        """
+        try:
+            # Load datasets
+            with open("actor_imdb_mapping.json", "r") as f:
+                actor_mapping = json.load(f)
+            with open("images.json", "r") as f:
+                images_data = json.load(f)
+        except FileNotFoundError as e:
+            missing_file = str(e).split("'")[-2]
+            return f"Sorry, the required dataset '{missing_file}' is missing. Please check if the file exists in the project directory."
+
+        # Get IMDb ID for the actor
+        imdb_id = actor_mapping.get(entity_label)
+        if not imdb_id:
+            return f"Sorry, I couldn't find IMDb information for {entity_label}."
+
+        # Search for images and frames of the actor
+        base_url = "https://files.ifi.uzh.ch/ddis/teaching/ATAI2024/dataset/movienet/images/"
+        images = []
+        frames = []
+
+        for item in images_data:
+            if imdb_id in item.get("cast", []):
+                image_url = base_url + item["img"]
+                if item.get("type") == "still_frame":
+                    frames.append(image_url)
+                else:
+                    images.append(image_url)
+
+        # Build the response message with URLs
+        response_message = []
+
+        # Show only one image if available
+        if images:
+            image_url = images[0]  # Get the first image
+            response_message.append(f"Here is an image of {entity_label}:")
+            response_message.append(f"Image: {image_url}")
+
+            # Display the image directly in the chat
+            try:
+                response = requests.get(image_url)
+                response.raise_for_status()
+                img = Image.open(BytesIO(response.content))
+
+                # Display the image with matplotlib
+                plt.imshow(img)
+                plt.axis('off')
+                plt.title(f"Image of {entity_label}")
+                plt.show()
+            except Exception as e:
+                response_message.append(f"Sorry, I found an image for {entity_label}, but there was an issue displaying it.")
+                print(f"[ERROR] Failed to display image: {e}")
+        else:
+            response_message.append(f"Sorry, I couldn't find any images for {entity_label}.")
+
+        # Show only one frame if available
+        if frames:
+            frame_url = frames[0]  # Get the first frame
+            response_message.append(f"\nHere is a frame of {entity_label}:")
+            response_message.append(f"Frame: {frame_url}")
+
+            # Display the frame directly in the chat
+            try:
+                response = requests.get(frame_url)
+                response.raise_for_status()
+                img = Image.open(BytesIO(response.content))
+
+                # Display the frame with matplotlib
+                plt.imshow(img)
+                plt.axis('off')
+                plt.title(f"Frame of {entity_label}")
+                plt.show()
+            except Exception as e:
+                response_message.append(f"Sorry, I found a frame for {entity_label}, but there was an issue displaying it.")
+                print(f"[ERROR] Failed to display frame: {e}")
+        else:
+            response_message.append(f"Sorry, I couldn't find any frames for {entity_label}.")
+
+        return "\n".join(response_message)
+
+    def get_movie_frames(self, imdb_id):
+        """
+        Retrieves URLs of frames for a specific movie based on its IMDb ID.
+        """
+        base_url = "https://files.ifi.uzh.ch/ddis/teaching/ATAI2024/dataset/movienet/frames/"
+        frames_url = base_url + imdb_id + "/"
+
+        # Generate sample frame URLs (modify as needed to dynamically fetch all frames)
+        return [
+            f"{frames_url}shot_0000_img_0.jpg",
+            f"{frames_url}shot_0000_img_1.jpg",
+            f"{frames_url}shot_0001_img_0.jpg",
+        ]
+
+    def answer_movie_frames_question(self, movie_title):
+        """
+        Answers questions about movie frames.
+        """
+        imdb_id = self.get_imdb_id(movie_title)  # Implement or use a mapping function
+        if not imdb_id:
+            return f"Sorry, I couldn't find frames for {movie_title}."
+
+        frames = self.get_movie_frames(imdb_id)
+        if not frames:
+            return f"Sorry, no frames are available for {movie_title}."
+
+        # Only show one frame
+        frame_url = frames[0]
+        return f"Here is a frame from {movie_title}:\nFrame: {frame_url}"
+
+    def get_imdb_id(self, movie_title):
+        """
+        Maps movie titles to IMDb IDs using the generated movie_imdb_mapping.json file.
+        """
+        try:
+            with open("movie_imdb_mapping.json", "r") as f:
+                movie_mapping = json.load(f)
+            print(f"[INFO] Loaded movie mapping from movie_imdb_mapping.json")
+        except (FileNotFoundError, json.JSONDecodeError):
+            print("[ERROR] Movie mapping file not found or is invalid.")
+            return None
         
-        for era in eras:
-            era = era.strip()  # Remove whitespace
-            if not era or len(era) < 2:  # Skip invalid entries
-                print(f"[DEBUG] Invalid era format: '{era}'")
-                continue
+        return movie_mapping.get(movie_title)
 
-            # Check if the era is a decade (e.g., "1980s")
-            if era.endswith("s") and era[:-1].isdigit():
-                start_year = int(era[:-1])
-                end_year = start_year + 9
-                parsed_eras.append((start_year, end_year))
-            elif era.isdigit():  # Single year (e.g., "1985")
-                year = int(era)
-                parsed_eras.append((year, year))
-            else:
-                print(f"[DEBUG] Invalid era format: '{era}'")
+    def load_crowd_data(self, file_path):
+        """
+        Loads the crowd data from the TSV file and returns a list of dictionaries.
+        """
+        crowd_data = []
+        try:
+            with open(file_path, 'r') as file:
+                reader = csv.DictReader(file, delimiter='\t')
+                for row in reader:
+                    crowd_data.append(row)
+            print(f"[INFO] Loaded crowd data from {file_path}")
+            return crowd_data
+        except FileNotFoundError:
+            print(f"Sorry, the file {file_path} was not found.")
+            return []
 
-        return parsed_eras
+        
+    def get_movie_data(self, movie_title, column_name):
+        """
+        Retrieves specific data (e.g., box office, publication date, executive producer) for a movie.
+        """
+        for row in self.crowd_data:
+            # Match the movie title with Input1ID, Input2ID, or Input3ID in the TSV
+            if movie_title in (row['Input1ID'], row['Input2ID'], row['Input3ID']):
+                return row.get(column_name, "Data not available.")
+        print(f"[DEBUG] No data found for movie title: {movie_title}")  # Add debugging for data matching
+        return "Sorry, no data found for {movie_title}."
+
+   
+    def get_answer_distribution(self, movie_title):
+        """
+        Retrieves the answer distribution and inter-rater agreement for a given movie title.
+        """
+        answer_counts = {"CORRECT": 0, "INCORRECT": 0}
+        workers = []
+        
+        for row in self.crowd_data:
+            # Match movie title with the subject (Input1ID), predicate (Input2ID), or object (Input3ID)
+            if movie_title in (row['Input1ID'], row['Input2ID'], row['Input3ID']):
+                answer_counts[row['AnswerLabel']] += 1
+                workers.append(row['WorkerId'])
+        
+        if len(workers) > 1:
+            # Calculate Fleiss' kappa (inter-rater agreement)
+            kappa = self.calculate_fleiss_kappa(answer_counts)
+        else:
+            kappa = None  # Not enough raters to calculate Fleiss' kappa
+        
+        return answer_counts, kappa
+
+    def calculate_fleiss_kappa(self, answer_counts):
+        """
+        Calculate Fleiss' kappa to measure inter-rater agreement.
+        """
+        total_ratings = sum(answer_counts.values())
+        p_i = {answer: count / total_ratings for answer, count in answer_counts.items()}
+        
+        # Fleiss' kappa formula (simplified version for binary classification)
+        P_e = sum([p * p for p in p_i.values()])
+        P_o = sum([min(count, total_ratings - count) / total_ratings for count in answer_counts.values()])
+        
+        return (P_o - P_e) / (1 - P_e)
+    
+    
+    def answer_crowdsourcing_question(self, question):
+        """
+        Answers crowdsourcing questions based on the question.
+        """
+        question = question.lower()
+
+        if "box office" in question:
+            movie_title = self.extract_movie_title(question)
+            box_office = self.get_movie_data(movie_title, 'box_office')
+            answer_distribution, kappa = self.get_answer_distribution(movie_title)
+            answer = f"The box office of {movie_title} is {box_office}. [Crowd, inter-rater agreement {kappa if kappa else 'N/A'}, The answer distribution for this specific task was {answer_distribution['CORRECT']} support votes, {answer_distribution['INCORRECT']} reject votes]"
+            return answer
+        
+        elif "publication date" in question:
+            movie_title = self.extract_movie_title(question)
+            publication_date = self.get_movie_data(movie_title, 'publication_date')
+            answer_distribution, kappa = self.get_answer_distribution(movie_title)
+            answer = f"The publication date of {movie_title} is {publication_date}. [Crowd, inter-rater agreement {kappa if kappa else 'N/A'}, The answer distribution for this specific task was {answer_distribution['CORRECT']} support votes, {answer_distribution['INCORRECT']} reject votes]"
+            return answer
+        
+        elif "executive producer" in question:
+            movie_title = self.extract_movie_title(question)
+            executive_producer = self.get_movie_data(movie_title, 'executive_producer')
+            answer_distribution, kappa = self.get_answer_distribution(movie_title)
+            answer = f"The executive producer of {movie_title} is {executive_producer}. [Crowd, inter-rater agreement {kappa if kappa else 'N/A'}, The answer distribution for this specific task was {answer_distribution['CORRECT']} support votes, {answer_distribution['INCORRECT']} reject votes]"
+            return answer
+
+        return "Sorry, I couldn't understand the question."
 
 
-
-
-
+    
+    def extract_movie_title(self, question):
+        """
+        Extracts the movie title from the question by stripping unnecessary words.
+        This is an improved version to handle various question patterns.
+        """
+        question = question.lower().strip().rstrip("?")  # Normalize the question
+        # Define question patterns to identify the start of the movie title
+        question_patterns = [
+            "who is the executive producer of",
+            "what is the box office of",
+            "can you tell me the publication date of",
+            "who directed",
+            "who starred in"
+        ]
+        
+        # Try to match the question with one of the patterns
+        for pattern in question_patterns:
+            if question.startswith(pattern):
+                # Extract the movie title by removing the known pattern
+                movie_title = question[len(pattern):].strip()
+                print(f"[DEBUG] Extracted movie title: {movie_title}")  # Add debugging
+                return movie_title
+        
+        # If no pattern matched, return an empty string
+        return ""
+    
     @staticmethod
     def get_time():
         return time.strftime("%H:%M:%S, %d-%m-%Y", time.localtime())
