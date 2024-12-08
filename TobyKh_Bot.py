@@ -11,7 +11,7 @@ import difflib
 from spacy.pipeline import EntityRuler
 from collections import Counter
 from sklearn.metrics.pairwise import cosine_similarity
-from colorama import Fore, Style  # For colored console output
+from colorama import Fore, Style
 import json
 import torch
 from torchvision.io import read_image
@@ -20,8 +20,9 @@ import matplotlib.pyplot as plt
 from PIL import Image
 import requests
 from io import BytesIO
+from pprint import pprint
 import csv
-
+import pandas as pd
 
 DEFAULT_HOST_URL = 'https://speakeasy.ifi.uzh.ch'
 listen_freq = 2
@@ -54,12 +55,15 @@ class Agent:
         self.graph.parse('14_graph.nt', format='turtle')
         graph_time = timeit.default_timer() - graph_start
         print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Graph loading and parsing time: {graph_time:.4f} seconds")
-        
+
         self.crowd_data = self.load_crowd_data("crowd_data.tsv")
-        
+        # Process and aggregate crowd data
+        self.crowd_aggregates = self.process_crowd_data(self.crowd_data)
+
         # Build dictionaries for labels, entities, and relations
         label_to_entity_start = timeit.default_timer()
         self.label_to_entity = self.build_label_to_entity_dict()
+        self.load_hardcoded_labels("labels.json")
         self.ent2lbl = {ent: str(lbl) for ent, lbl in self.graph.subject_objects(rdflib.RDFS.label)}
         self.relation_to_uri = self.build_relation_to_uri_dict()
         label_to_entity_time = timeit.default_timer() - label_to_entity_start
@@ -77,12 +81,12 @@ class Agent:
         self.nlp = self.add_movie_title_patterns(self.nlp)
         nlp_time = timeit.default_timer() - nlp_start
         print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} spaCy model loading and movie title patterns setup time: {nlp_time:.4f} seconds")
-        
+
         self.model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
         self.model.eval()
         self.model = torch.nn.Sequential(*list(self.model.children())[:-1])
         self.preprocess = ResNet18_Weights.DEFAULT.transforms()
-        
+
         # Print total initialization time
         init_time = timeit.default_timer() - init_start
         print("="*40)
@@ -118,12 +122,98 @@ XXX  /          XXXXXX      \\           ---
 Hello! You can ask me factual questions about movies.
         ''')
 
+    def load_hardcoded_labels(self, filepath):
+        """
+        Loads a JSON file that contains 'entity_labels' and 'property_labels',
+        and creates reverse mappings from label text to wikidata IDs.
+        Also integrates these labels into label_to_entity for entity resolution.
+        """
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            print(f"[ERROR] {filepath} not found. No hardcoded mappings loaded.")
+            self.label_to_wikidata = {}
+            return
+
+        entity_labels = data.get("entity_labels", {})
+        property_labels = data.get("property_labels", {})
+
+        self.label_to_wikidata = {}
+
+        # For each entity label from the JSON:
+        # 1. Add a reverse mapping (label to 'wd:Q####') in self.label_to_wikidata
+        # 2. Also add to self.label_to_entity if it's not already there
+        for qid, label in entity_labels.items():
+            if label:
+                normalized_label = label.lower()
+                self.label_to_wikidata[normalized_label] = f"wd:{qid}"
+
+                # Add to label_to_entity using a URIRef to represent the entity
+                # 'wd:Q11621' -> 'http://www.wikidata.org/entity/Q11621'
+                # Check if not already in label_to_entity to avoid overwriting 
+                # graph-based label
+                if normalized_label not in self.label_to_entity:
+                    entity_uri = rdflib.URIRef(f"http://www.wikidata.org/entity/{qid}")
+                    self.label_to_entity[normalized_label] = entity_uri
+
+        # For properties, just do the label_to_wikidata mapping since they aren't 
+        # part of the entity dictionary
+        for pid, label in property_labels.items():
+            if label:
+                self.label_to_wikidata[label.lower()] = f"wdt:{pid}"
+
+        print("[INFO] Hardcoded label mappings loaded and integrated into label_to_entity from labels.json")
+
+    def process_crowd_data(self, crowd_data):
+        """
+        Aggregates crowd data by triple keys (Input1ID, Input2ID, Input3ID),
+        counts correct/incorrect answers, and computes a simple inter-rater agreement.
+        """
+        if not crowd_data:
+            print("[INFO] No crowd data loaded.")
+            return {}
+
+        df = pd.DataFrame(crowd_data)
+        # Convert AnswerLabel to a uniform type (string)
+        df['AnswerLabel'] = df['AnswerLabel'].astype(str)
+
+        grouping_cols = ['Input1ID', 'Input2ID', 'Input3ID']
+
+        def compute_inter_rater_agreement(correct_count, incorrect_count):
+            total = correct_count + incorrect_count
+            if total == 0:
+                return 0.0
+            return max(correct_count, incorrect_count) / total
+
+        # Aggregate data
+        agg = df.groupby(grouping_cols).apply(lambda g: pd.Series({
+            'correct_count': (g['AnswerLabel'] == 'CORRECT').sum(),
+            'incorrect_count': (g['AnswerLabel'] == 'INCORRECT').sum(),
+            'crowd_answer_value': g['Input3ID'].iloc[0]  # Directly using Input3ID as the answer
+        })).reset_index()
+
+        agg['inter_rater_agreement'] = agg.apply(
+            lambda row: compute_inter_rater_agreement(row['correct_count'], row['incorrect_count']), axis=1
+        )
+        agg['answer_distribution'] = agg.apply(
+            lambda row: f"{row['correct_count']} support votes, {row['incorrect_count']} reject votes", axis=1
+        )
+
+        results_dict = {}
+        for _, row in agg.iterrows():
+            triple_key = (row['Input1ID'], row['Input2ID'], row['Input3ID'])
+            results_dict[triple_key] = {
+                'inter_rater_agreement': row['inter_rater_agreement'],
+                'answer_distribution': row['answer_distribution'],
+                'crowd_answer_value': row['crowd_answer_value']
+            }
+        return results_dict
 
     def is_reccomendation_request(self,question):
         doc = self.nlp(question)
         question = question.lower()
 
-        # Define possible recommendation patterns based on dependency structure
         recommendation_patterns = [
             ("recommend", ["movies", "films", "similar", "like"]),
             ("suggest", ["movies", "films", "similar", "like"]),
@@ -157,19 +247,6 @@ Hello! You can ask me factual questions about movies.
         "based on my taste for", "for someone who loves", "for a fan of",
         "give I like", "given my taste", "given my penchant for",
         "suppose I like",
-        
-        # Specific examples
-        "Given that I like The Lion King, Pocahontas, and The Beauty and the Beast, can you recommend some movies?",
-        "Recommend movies like Nightmare on Elm Street, Friday the 13th, and Halloween.",
-        "I enjoy Disney movies like Aladdin and The Little Mermaid, any recommendations?",
-        "I like horror movies from the 1980s, can you suggest similar films?",
-        "Suggest movies similar to animated Disney classics like Snow White and Cinderella.",
-        "Can you recommend some horror classics from the 1970s or 1980s?",
-        "I loved watching classic animated movies, what should I watch next?",
-        "I'm a fan of slasher films like Halloween and Scream, any other movies in that genre?",
-        "For someone who loves animated movies, what do you recommend?",
-        "What movies would you recommend to a Disney animation fan?",
-        "Are there similar movies to The Lion King or other Disney classics?"
     ]
 
         if any(phrase in question for phrase in recommendation_phrases):
@@ -178,24 +255,19 @@ Hello! You can ask me factual questions about movies.
         for token in doc:
             for verb, keywords in recommendation_patterns:
                 if token.lemma_ == verb:
-                    # Check if any keyword appears in the sentence with the verb
                     for child in token.children:
                         if child.lemma_ in keywords:
                             return True
         return False
 
     def add_movie_title_patterns(self, nlp):
-
         ruler = nlp.add_pipe('entity_ruler', before='ner')
-
         movie_patterns = []
         with open('top_10000_movies_by_votes.txt', 'r') as file:
             for line in file:
                 title = line.strip()
-                # Create a pattern for each title to be recognized as a WORK_OF_ART entity
                 movie_patterns.append({"label": "WORK_OF_ART", "pattern": title})
         
-        # Add all movie patterns to the EntityRuler
         ruler.add_patterns(movie_patterns)
         patterns = [
             {
@@ -234,12 +306,9 @@ Hello! You can ask me factual questions about movies.
                 "label": "WORK_OF_ART",
                 "pattern": [{"TEXT": "Apocalypse"}, {"TEXT": "Now"}]
             },
-            # Add more patterns as needed
         ]
         ruler.add_patterns(patterns)
-    
         return nlp
-
 
     def build_label_to_entity_dict(self):
         label_to_entity = {}
@@ -288,126 +357,357 @@ Hello! You can ask me factual questions about movies.
                     room.initiated = True
                 
                 for message in room.get_messages(only_partner=True, only_new=True):
-                    # Capture the current time for the incoming question
-                    timestamp = self.get_time()
-
-                    # [INCOMING QUESTION] Message
+                    
                     print(f"{Fore.RED}[INCOMING QUESTION]{Style.RESET_ALL}")
                     print(f"Chatroom ID: {room.room_id}")
                     print(f"Message #{message.ordinal}: '{message.message}'")
-                    print(f"Timestamp: {timestamp}\n")
+                    print(f"Timestamp: {self.get_time()}\n")
                     time.sleep(0.5)
 
-                    # Process the question
                     question = message.message
                     print(f"{Fore.YELLOW}[PROCESSING BACKGROUND]{Style.RESET_ALL}")
                     response = self.process_question(question)
                     print("...processing complete.\n")
 
-                    # [ANSWER RETURNED] Message
                     print(f"{Fore.GREEN}[ANSWER RETURNED]{Style.RESET_ALL}")
                     print(f"Response: {response}\n")
 
-                    # Post response to the chatroom and mark message as processed
                     room.post_messages(response)
                     room.mark_as_processed(message)
                     
             time.sleep(listen_freq)
 
-
     def process_question(self, question):
         """
-        Process a user's question and determine the appropriate response.
+        Processes the user's question by first checking hardcoded mappings for entities and relations.
+        If not found, falls back to normal NER and relation extraction.
+        Then determines the type of request (multimedia, recommendation, factual) and responds accordingly.
         """
-        # Normalize the question for easier matching
+        # Normalize the question
         normalized_question = question.lower().strip().rstrip(".!?")
 
-        # Use the NLP model to extract entities and additional information
-        doc = self.nlp(question)
-        info = self.extract_entities(question)
-        print(info)
 
-        # Extract relevant details
-        movie_titles = info.get('movie_titles', [])
-        cast_names = info.get('cast_names', [])
-        entity_label = movie_titles[0] if movie_titles else (cast_names[0] if cast_names else None)
+        # Step 1: Check Hardcoded Mappings First
+        detected_mappings = []
+        for label_text, wikidata_id in self.label_to_wikidata.items():
+            if label_text in normalized_question:
+                detected_mappings.append((label_text, wikidata_id))
 
-        # Handle multimedia-related questions
+        entity_uri = None
+        relation_uri = None
+        entity_label = None
+        relation_label = None
+
+        # Distinguish between entities and properties in detected mappings
+        for label_text, wikidata_id in detected_mappings:
+            if wikidata_id.startswith("wd:") and not entity_uri:
+                entity_uri = wikidata_id
+                entity_label = label_text  # Assuming label_text is the entity label
+            elif wikidata_id.startswith("wdt:") and not relation_uri:
+                relation_uri = wikidata_id
+                relation_label = label_text  # Assuming label_text is the relation label
+
+        # Debug print after hardcoded mapping
+        print("[DEBUG] After hardcoded mapping:")
+        print(f"Entity Label: {entity_label}, Entity URI: {entity_uri}")
+        print(f"Relation Label: {relation_label}, Relation URI: {relation_uri}")
+
+        # Step 2: Fallback to Normal Extraction if Needed
+        if not entity_uri or not relation_uri:
+            doc = self.nlp(question)
+            info = self.extract_entities(question)
+
+            if not entity_uri:
+                entity_label = self.get_main_entity(info, doc)
+                if entity_label:
+                    entity_uri = self.match_entity(entity_label)
+
+            if not relation_uri:
+                relation_label = self.extract_relation_spacy(doc)
+                if relation_label:
+                    relation_uri = self.match_relation_label(relation_label)
+
+            # Debug print after normal extraction
+            print("[DEBUG] After normal extraction:")
+            print(f"Entity Label: {entity_label}, Entity URI: {entity_uri}")
+            print(f"Relation Label: {relation_label}, Relation URI: {relation_uri}")
+
+        # Step 3: Validate Extraction Results
+        if not entity_uri:
+            return "Sorry, I couldn't identify the entity you're asking about."
+
+        if not relation_uri and not entity_label:
+            return "Sorry, I couldn't understand what property you're asking about."
+
+        # Step 4: Retrieve Labels if Missing
+        if not relation_label:
+            relation_label = "this property"
+
+        if not entity_label and entity_uri:
+            uri_ref = rdflib.URIRef(entity_uri.replace("wd:", "http://www.wikidata.org/entity/"))
+            entity_label = self.ent2lbl.get(uri_ref, "this entity")
+
+        # Step 5: Determine the Type of Request
         multimedia_phrases = {
             "show me", "look like", "let me know what", "can you show", 
             "picture of", "image of", "appearance of", "frame of", "frames of", "scene of"
         }
 
-        if any(phrase in normalized_question for phrase in multimedia_phrases):
-            if "frames" in normalized_question:
-                if entity_label:
-                    return self.answer_movie_frames_question(entity_label)
-                return "Sorry, I couldn't identify the movie you're asking about."
-            if entity_label:
-                return self.answer_multimedia_question(entity_label)
-            return "Sorry, I couldn't find the person or movie you're referring to. Could you clarify?"
 
-        # Handle recommendation questions
-        if info['eras'] and not movie_titles:
-            recommendations = self.get_movies_by_era(info['eras'])
-            return self.format_reccomendations(recommendations)
+        print(f"[DEBUG] Normalized Question: '{normalized_question}'")  # Added debug statement
+        if any(phrase in normalized_question for phrase in multimedia_phrases):
+            print("["*10 +"MULTIMEDIA"+"]"*10)
+            print("*"*10)
+            # Handle Multimedia Requests
+            if "frames" in normalized_question and entity_label:
+                return self.answer_movie_frames_question(entity_label)
+            elif entity_label:
+                return self.answer_multimedia_question(entity_label)
+            else:
+                return "Sorry, I couldn't find the person or movie you're referring to. Could you clarify?"
 
         if self.is_reccomendation_request(question):
-            print(f"[DEBUG] Extracted recommendation info: {info}")
+            # Handle Recommendation Requestsa
+            print("[DEBUG] Identified recommendation request.")
             recommendations = self.get_recommendations(
-                movie_titles, num_recommendations=5, genre=info['genres'], era=info['eras']
+                info.get('movie_titles', []), 
+                num_recommendations=5, 
+                genre=info.get('genres', []), 
+                era=info.get('eras', [])
             )
             return self.format_reccomendations(recommendations)
 
-        # Handle crowdsourcing-related questions
-        if "box office" in normalized_question or "publication date" in normalized_question or "executive producer" in normalized_question:
-            # Handle crowdsourcing questions related to movie data
-            return self.answer_crowdsourcing_question(question)
+        # Step 6: Handle Factual Questions
+        return self.answer_factual_question(entity_label, relation_label, entity_uri, relation_uri)
 
-        # Extract entities and relations
-        entities = [
-            (ent.text, ent.label_) for ent in doc.ents
-            if ent.label_ in ['PERSON', 'WORK_OF_ART', 'ORG', 'GPE', 'EVENT', 'PRODUCT']
-        ]
-        relation_label = self.extract_relation_spacy(doc)
+    def get_main_entity(self, info, doc):
+        """
+        Select a primary entity from the extracted information.
+        Priority: movie_titles > cast_names > other recognized entities in doc.
+        """
+        movie_titles = info.get('movie_titles', [])
+        cast_names = info.get('cast_names', [])
 
-        print(f"Extracted entities: {entities}")
-        print(f"Extracted relation: {relation_label}")
+        # If no movie or cast, try generic entities from doc.ents
+        if not movie_titles and not cast_names:
+            generic_entities = [ent.text for ent in doc.ents if ent.label_ in ['PERSON','ORG','WORK_OF_ART','GPE','EVENT','PRODUCT']]
+            if generic_entities:
+                return generic_entities[0].strip()
 
-        # Handle factual or embedding questions
-        if entities and relation_label:
-            entity_label = entities[0][0]  # Take the first extracted entity
-            print(f"Entity label: {entity_label}")
+        if movie_titles:
+            return movie_titles[0].strip()
+        if cast_names:
+            return cast_names[0].strip()
+
+        return None
+
+    def answer_factual_question(self, entity_label, relation_label, entity_uri=None, relation_uri=None):
+        """
+        Attempts to answer a factual question using:
+        1. Crowd data
+        2. Knowledge Graph (KG)
+        3. Embedding-based fallback
+        """
+        print("*"*60)
+        print(f"Factual question about {entity_label} and relation {relation_label}")
+        print("*"*60)
+
+        # If entity_uri not provided, try to derive it from entity_label
+        if not entity_uri:
             entity_uri = self.match_entity(entity_label)
-            print(f"Matched entity URI: {entity_uri}")
+            if not entity_uri:
+                return f"Sorry, I couldn't find information about '{entity_label}'."
+
+        # If relation_uri not provided, try to derive it from relation_label
+        if not relation_uri:
             relation_uri = self.match_relation_label(relation_label)
-            print(f"Matched relation URI: {relation_uri}")
+            if not relation_uri:
+                return f"Sorry, I couldn't find a known relation for '{relation_label}'."
 
-            if entity_uri and relation_uri:
-                sparql_query = self.construct_sparql_query(entity_uri, relation_uri, relation_label)
-                factual_answers = self.execute_sparql_query(sparql_query, relation_label)
+        entity_uri = self.short_form_uri(entity_uri)
+        relation_uri = self.short_form_uri(relation_uri)
 
-                if not factual_answers:
-                    embedding_answers = self.predict_with_embeddings(entity_uri, relation_uri)
-                else:
-                    embedding_answers = None
+        print("*"*60)
+        print(f"Querying Crowdsource euri: {entity_uri} and ruri: {relation_uri}")
+        print("*"*60)
 
-                return self.get_response(entity_label, relation_label, factual_answers, embedding_answers)
+        triple_key = self.get_triple_key_from_entity_and_relation(entity_uri, relation_uri)
 
-            return f"Sorry, I couldn't find information about '{entity_label}' or understand the relation '{relation_label}'."
+        
+        # Attempt crowd data
+        crowd_response = self.answer_crowdsourcing_question(entity_label, relation_label, triple_key)
 
-        # Handle cases with partial information
-        if entities:
-            entity_label = entities[0][0]
-            return f"Sorry, I managed to find the entity '{entity_label}', but was unable to parse your question. Could you try rephrasing?"
+        # Attempt KG
+        kg_answers = self.get_kg_answers(entity_uri, relation_uri, relation_label)
 
-        if relation_label:
-            return f"Sorry, I understood your question about '{relation_label}' but couldn't find the film. Is it spelled correctly?"
+        # Attempt embeddings if KG fails and no crowd data
 
-        # Fallback response for unrecognized questions
-        return "Sorry, I didn't quite get that. Can you rephrase your question, please?"
+        if not kg_answers and not crowd_response:
 
+            print("*"*60)
+            print("Attempting embedding")
+            print("*"*60)
+            embedding_answers = self.predict_with_embeddings(self.lengthen_uri(entity_uri), self.lengthen_uri(relation_uri))
+            if embedding_answers:
+                return self.format_embedding_answer(entity_label, relation_label, embedding_answers)
+            else:
+                return f"Sorry, I couldn't find any information about the {relation_label} of {entity_label}."
 
+        # Combine results
+        final_response = ""
+        if crowd_response:
+            final_response += crowd_response
+        if kg_answers:
+            kg_answer_str = ', '.join(kg_answers)
+            if final_response:
+                final_response += f"According to the knowledge graph, the {relation_label} is: {kg_answer_str}."
+            else:
+                final_response = f"The {relation_label} of {entity_label} according to the knowledge graph is: {kg_answer_str}."
+
+        if not final_response:
+            # If somehow we got here with no crowd_response and no kg, fallback handled above.
+            return f"Sorry, I couldn't find any information about the {relation_label} of {entity_label}."
+
+        return final_response    
+
+    def get_crowd_answer_value(self, triple_key):
+        """
+        Retrieves the most supported answer from crowd data for the given triple_key.
+
+        Args:
+            triple_key (tuple): The triple key (Input1ID, Input2ID, Input3ID).
+
+        Returns:
+            str or None: The most supported crowd answer or None if unavailable.
+        """
+        data = self.crowd_aggregates.get(triple_key)
+        if not data:
+            return None
+
+        return data.get('crowd_answer_value')
+
+    def answer_crowdsourcing_question(self, entity_label, relation_label, triple_key):
+        """
+        Given the entity_label, relation_label, and triple_key, returns the formatted crowd-sourced response.
+        
+        Args:
+            entity_label (str): The label of the entity (e.g., movie title).
+            relation_label (str): The label of the relation (e.g., "box office").
+            triple_key (tuple): The triple key (Input1ID, Input2ID, Input3ID).
+        
+        Returns:
+            str: The formatted response based on crowd data, or an apology if no data is found.
+        """
+        # Check if we have crowd data for this triple
+        if triple_key not in self.crowd_aggregates:
+            return ""
+        
+        data = self.crowd_aggregates[triple_key]
+        irr = data['inter_rater_agreement']
+        distribution = data['answer_distribution']
+        
+        # Retrieve the crowd answer value from the precomputed data
+        crowd_answer_value = self.get_crowd_answer_value(triple_key)
+
+        # Function to determine if a string is a QID
+        def is_qid(value):
+            if isinstance(value, str):
+                if value.startswith('wd:'):
+                    value = value[3:]
+                return value.startswith('Q') and value[1:].isdigit()
+            return False
+
+        # If the answer is a QID, retrieve its label
+        if is_qid(crowd_answer_value):
+            # Construct the full URI for the QID
+            qid_uri = f"http://www.wikidata.org/entity/{crowd_answer_value}"
+            # Retrieve the label from ent2lbl
+            crowd_answer_label = self.ent2lbl.get(rdflib.URIRef(qid_uri))
+            print(crowd_answer_label)
+            if crowd_answer_label:
+                crowd_answer_value = crowd_answer_label
+            else:
+                # If label not found, retain the QID
+                print(f"[WARNING] Label for QID {crowd_answer_value} not found.")
+            
+        if crowd_answer_value:
+            response = (
+                f"The {relation_label} of {entity_label} is {crowd_answer_value}.\n"
+                f"[Crowd, inter-rater agreement {irr:.3f}, The answer distribution was {distribution}]\n\n"
+        )
+        else:
+            # If no direct answer value is found, just report the distribution and IRR
+            response = (
+                f"[Crowd data available but no direct answer extracted for {relation_label} of {entity_label}. "
+                f"Inter-rater agreement {irr:.3f}, distribution {distribution}]"
+            )
+        
+        return response
+
+    def get_kg_answers(self, entity_uri, relation_uri, relation_label):
+        """
+        Queries the knowledge graph for answers.
+        """
+        entity_uri = self.lengthen_uri(entity_uri)
+        relation_uri = self.lengthen_uri(relation_uri)
+
+        print("*"*60)
+        print("Querying the knowledge graph")
+        print("*"*60)
+        sparql_query = self.construct_sparql_query(entity_uri, relation_uri, relation_label)
+        kg_answers = self.execute_sparql_query(sparql_query, relation_label)
+        print(kg_answers)
+        return kg_answers
+
+    def get_embedding_answers(self, entity_uri, relation_uri):
+        """
+        Uses embedding-based predictions as a fallback.
+        """
+        return self.predict_with_embeddings(entity_uri, relation_uri)
+
+    def format_embedding_answer(self, entity_label, relation_label, embedding_answers):
+        answer_str = (
+            f"Our top pick is {embedding_answers[0]},\n "
+            f"But it could also be {embedding_answers[1]}\n "
+            f"Or perhaps {embedding_answers[2]}."
+        )
+        response = (
+            f"We couldn't find the {relation_label} information for {entity_label} in our knowledge graph or crowd data.\n\n"
+            f"However, based on our embeddings:\n {answer_str}.\n (Embedding Answer)"
+        )
+        return response
+
+    def lengthen_uri(self, short_uri):
+        """
+        Converts a short URI (e.g., 'wd:Q457180') to its full URI (e.g., 'http://www.wikidata.org/entity/Q457180').
+
+        Args:
+            short_uri (str): The short form URI to be converted.
+
+        Returns:
+            str: The full URI corresponding to the short URI.
+
+        Raises:
+            ValueError: If the short_uri does not start with a recognized prefix.
+        """
+        # Define the mapping from short prefixes to full URI bases
+        prefix_mapping = {
+            'wd:': 'http://www.wikidata.org/entity/',
+            'wdt:': 'http://www.wikidata.org/prop/direct/',
+            'wds:': 'http://www.wikidata.org/entity/statement/',  # Example for other prefixes
+            # Add more prefixes as needed
+        }
+
+        # Iterate through the prefix mapping to find a matching prefix
+        for prefix, full_base in prefix_mapping.items():
+            if short_uri.startswith(prefix):
+                # Extract the identifier part after the prefix
+                identifier = short_uri[len(prefix):]
+                # Construct and return the full URI
+                return f"{full_base}{identifier}"
+
+        # If no matching prefix is found, raise an error
+        raise ValueError(f"Unrecognized URI prefix in '{short_uri}'.")
 
     def extract_relation_spacy(self, doc):
         possible_relations = set(self.relation_to_uri.keys())
@@ -449,88 +749,24 @@ Hello! You can ask me factual questions about movies.
                 return chunk_lemma
 
         return None
-    def is_crowdsourcing_question(self, question):
-        """
-        Determine if the question relates to crowdsourcing topics like revenue, box office, etc.
-        """
-        crowdsourcing_keywords = ["box office", "votes", "crowdsourcing", "revenue", "publication date", "producer", "director"]
-        # You could expand the list to include other keywords as needed.
-        return any(keyword in question.lower() for keyword in crowdsourcing_keywords)
-
-    def get_movie_genre(self, movie_uri):
-        """
-        Retrieve the genre(s) of a movie from the RDF graph using its URI.
-        """
-        query = f"""
-        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-        
-        SELECT ?genreLabel WHERE {{
-            <{movie_uri}> wdt:P136 ?genre .
-            ?genre rdfs:label ?genreLabel .
-            FILTER (lang(?genreLabel) = "en")
-        }}
-        """
-        try:
-            results = self.graph.query(query)
-            genres = [str(row['genreLabel']) for row in results]
-            return genres
-        except Exception as e:
-            print(f"Error retrieving genres for {movie_uri}: {e}")
-            return []
-
-    def get_movie_year(self, movie_uri):
-        """
-        Retrieve the release year of a movie from the RDF graph using its URI.
-        """
-        query = f"""
-        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-        
-        SELECT ?year WHERE {{
-            <{movie_uri}> wdt:P577 ?date .
-            BIND(YEAR(?date) AS ?year)
-        }}
-        LIMIT 1
-        """
-        try:
-            results = self.graph.query(query)
-            for row in results:
-                return int(row['year'])
-        except Exception as e:
-            print(f"Error retrieving year for {movie_uri}: {e}")
-            return None
 
     def extract_entities(self, question):
-        """
-        Extracts entities like movie titles, cast names, genres, and eras from the question.
-        """
         doc = self.nlp(question)
 
-        # Extract movie titles from named entities
         movie_titles = [ent.text for ent in doc.ents if ent.label_ == "WORK_OF_ART"]
-
-        # Extract cast names (actors/actresses)
         cast_names = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
 
-        # Load genre keywords
         with open("genres.txt", 'r') as file:
             genre_keywords = {line.strip().lower() for line in file}
-
-        # Define era keywords
         era_keywords = {
             "1970s", "1980s", "1990s", "2000s", "2010s", "2020s",
             "classic", "old", "retro",
             "70s", "80s", "90s", "twentieth century"
         }
 
-        # Extract genres
         genres = {token.text.lower() for token in doc if token.text.lower() in genre_keywords}
-
-        # Extract explicit eras from era keywords
         detected_eras = {token.text.lower() for token in doc if token.text.lower() in era_keywords}
 
-        # Infer eras based on movie titles' release years
         inferred_eras = [
             self.get_movie_year(self.match_entity(title))
             for title in movie_titles
@@ -542,26 +778,16 @@ Hello! You can ask me factual questions about movies.
             if year is not None
         )
 
-        # Combine detected and inferred eras
         eras = detected_eras.union(inferred_eras)
-
-        # Debugging logs
-        if not (movie_titles or cast_names or genres or eras):
-            print(f"[DEBUG] No entities extracted for question: {question}")
 
         print(f"Extracted entities: Movie Titles: {movie_titles}, Cast Names: {cast_names}, Genres: {genres}, Eras: {eras}")
 
-        # Return all extracted entities
         return {
             "movie_titles": movie_titles,
             "cast_names": cast_names,
             "genres": list(genres),
             "eras": list(eras)
         }
-
-
-
-
 
     def match_entity(self, entity_text):
         labels = list(self.label_to_entity.keys())
@@ -575,223 +801,116 @@ Hello! You can ask me factual questions about movies.
     def match_relation_label(self, relation_label):
         return self.relation_to_uri.get(relation_label.lower())
 
-    from collections import Counter
-
-    def is_horror_movie(self, movie_uri):
-        """
-        Check if the movie belongs to the horror genre.
-        """
-        genres = self.get_movie_genre(movie_uri)
-        return "Horror" in genres
-
-    def get_recommendations(self, movie_titles, num_recommendations=5, genre=None, era=None):
-        all_recommendations = []
-
-        # If era is a list, extract the first value for processing
-        if isinstance(era, list) and len(era) > 0:
-            era = era[0]  # Use the first era for filtering
-        elif isinstance(era, list):
-            era = None  # Set to None if the list is empty
-
-        if movie_titles:
-            for movie_title in movie_titles:
-                movie_uri = self.match_entity(movie_title)
-                if not movie_uri:
-                    print(f"Movie '{movie_title}' not recognized. Skipping.")
-                    continue
-
-                movie_id = self.ent2id.get(movie_uri)
-                if movie_id is None:
-                    print(f"Embeddings not found for '{movie_title}'. Skipping.")
-                    continue
-
-                target_embedding = self.entity_emb[movie_id].reshape(1, -1)
-                similarities = cosine_similarity(target_embedding, self.entity_emb).flatten()
-
-                similar_indices = np.argsort(-similarities)[1:]  # Exclude the movie itself
-                for idx in similar_indices:
-                    similar_movie_uri = self.id2ent[idx]
-                    similar_movie_title = self.ent2lbl.get(similar_movie_uri)
-
-                    # Skip if no title is found
-                    if not similar_movie_title:
-                        continue
-
-                    # Retrieve genres for the similar movie
-                    genres = self.get_movie_genre(similar_movie_uri) or []
-
-                    # Convert genres to lowercase for case-insensitive comparison
-                    genres_lower = [genre.lower() for genre in genres]
-
-                    # Exclude movies classified as documentaries
-                    if "documentary" in genres_lower:
-                        print(f"Excluding {similar_movie_title} (documentary).")
-                        continue
-
-                    # Filter recommendations based on genre
-                    if genre and genre.lower() not in genres_lower:
-                        continue
-
-                    # Filter recommendations based on era
-                    if era and not self.is_within_era(similar_movie_uri, era):
-                        continue
-
-                    # Add valid recommendations
-                    all_recommendations.append(similar_movie_title)
-
-                    # Stop if we've gathered enough recommendations
-                    if len(all_recommendations) >= num_recommendations * len(movie_titles):
-                        break
-
-        else:
-            # Handle recommendations based only on genre and/or era
-            if genre and era:
-                all_recommendations = self.get_movies_by_genre_and_era(genre, era)
-            elif genre:
-                all_recommendations = self.get_movies_by_genre(genre)
-            elif era:
-                all_recommendations = self.get_movies_by_era(era)
-
-        # Deduplicate and rank recommendations for diversity
-        ranked_recommendations = Counter(all_recommendations)
-        sorted_recommendations = [title for title, _ in ranked_recommendations.most_common(num_recommendations)]
-        final_recommendations = [movie for movie in sorted_recommendations if movie not in movie_titles]
-
-        print(f"Final Recommendations: {final_recommendations[:num_recommendations]}")
-        return final_recommendations[:num_recommendations]
-
-
     def is_within_era(self, movie_uri, era):
-        # Parse era into start and end year
         start_year, end_year = self.parse_era([era])[0]
-        
-        # Retrieve the movie's release year
         movie_year = self.get_movie_year(movie_uri)
         if not movie_year:
             return False
-
-        # Check if the movie falls within the specified era
         return start_year <= movie_year <= end_year
 
+    def get_triple_key_from_entity_and_relation(self, entity_uri, relation_uri):
+        """
+        attempts to find a triple key in self.crowd_aggregates that matches the given entity_uri and relation_uri.
+        the triple key is of the form (input1id, input2id, input3id).
+        
+        assumptions:
+        - entity_uri corresponds to input1id
+        - relation_uri corresponds to input2id
+        - input3id is unknown; we pick the first triple found.
+        
+        if no match is found, returns none.
+        """
+        
+        for triple_key in self.crowd_aggregates.keys():
+            # triple_key is something like (input1id, input2id, input3id)
+            # check if the first two elements match our entity and relation uris
+            if triple_key[0] == str(entity_uri) and triple_key[1] == str(relation_uri):
+                print(f"*"*10)
+                print("triple key in crowdsource")
+                print("*"*10)
+                return triple_key
+
+        return None
 
     def construct_sparql_query(self, entity_uri, relation_uri, relation_label):
-        
-        # Query to get the director
-        if relation_label == "director":  # Director relation
+        if relation_label == "director":
             query = f'''
             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
             PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-            PREFIX wd: <http://www.wikidata.org/entity/>
-            
             SELECT ?directorLabel WHERE {{
                 <{entity_uri}> <{relation_uri}> ?director .
                 ?director rdfs:label ?directorLabel .
                 FILTER (lang(?directorLabel) = "en")
-            }}
-            LIMIT 5
+            }} LIMIT 5
             '''
-        # Query to get the publication date
-        elif relation_label == "publication date":  # Publication date relation
+        elif relation_label == "publication date":
             query = f'''
             PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-            PREFIX wd: <http://www.wikidata.org/entity/>
-            
             SELECT ?publicationDate WHERE {{
                 <{entity_uri}> <{relation_uri}> ?publicationDate .
-            }}
-            LIMIT 5
+            }} LIMIT 5
             '''
-            # Query to get the movie rating
         elif relation_label == "rating":
             query = f'''
             PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-            PREFIX wd: <http://www.wikidata.org/entity/>
-            
             SELECT ?rating WHERE {{
                 <{entity_uri}> <{relation_uri}> ?rating .
-            }}
-            LIMIT 1
+            }} LIMIT 1
             '''
-
-        # Query to get the movie genre
         elif relation_label == "genre":
             query = f'''
             PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-            PREFIX wd: <http://www.wikidata.org/entity/>
-            
+            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
             SELECT ?genreLabel WHERE {{
                 <{entity_uri}> <{relation_uri}> ?genre .
                 ?genre rdfs:label ?genreLabel .
                 FILTER (lang(?genreLabel) = "en")
-            }}
-            LIMIT 3
+            }} LIMIT 3
             '''
-
-        # Query to get the cast of the movie
         elif relation_label == "cast":
             query = f'''
             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
             PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-            PREFIX wd: <http://www.wikidata.org/entity/>
-            
             SELECT ?actorLabel WHERE {{
                 <{entity_uri}> <{relation_uri}> ?actor .
                 ?actor rdfs:label ?actorLabel .
                 FILTER (lang(?actorLabel) = "en")
-            }}
-            LIMIT 10
+            }} LIMIT 10
             '''
-
         elif relation_label == "screenwriter":
             query = f'''
-        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-        PREFIX wd: <http://www.wikidata.org/entity/>
-
-        SELECT ?screenwriterLabel WHERE {{
-            <{entity_uri}> wdt:P58 ?screenwriter .  # P58 is the property for screenwriter
-            ?screenwriter rdfs:label ?screenwriterLabel .
-            FILTER (lang(?screenwriterLabel) = "en")
-        }}
-        LIMIT 5
-        '''
-
+            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+            PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+            SELECT ?screenwriterLabel WHERE {{
+                <{entity_uri}> wdt:P58 ?screenwriter .
+                ?screenwriter rdfs:label ?screenwriterLabel .
+                FILTER (lang(?screenwriterLabel) = "en")
+            }} LIMIT 5
+            '''
         elif relation_label == "cast member":
             query = f'''
-        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-        PREFIX wd: <http://www.wikidata.org/entity/>
-
-        SELECT ?castMemberLabel WHERE {{
-            <{entity_uri}> <{relation_uri}> ?castMember .
-            ?castMember rdfs:label ?castMemberLabel .
-            FILTER (lang(?castMemberLabel) = "en")
-        }}
-        LIMIT 15
-        '''
-
+            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+            PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+            SELECT ?castMemberLabel WHERE {{
+                <{entity_uri}> <{relation_uri}> ?castMember .
+                ?castMember rdfs:label ?castMemberLabel .
+                FILTER (lang(?castMemberLabel) = "en")
+            }} LIMIT 15
+            '''
         else:
             query = f'''
             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
             PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-            PREFIX wd: <http://www.wikidata.org/entity/>
-            
             SELECT ?valueLabel WHERE {{
                 <{entity_uri}> <{relation_uri}> ?value .
                 ?value rdfs:label ?valueLabel .
                 FILTER (lang(?valueLabel) = "en")
-            }}
-            LIMIT 5
-            ''' 
-
+            }} LIMIT 5
+            '''
         return query
 
     def execute_sparql_query(self, query, relation_label):
         results = self.graph.query(query)
-        for row in results:
-            print(row)  # Debug output
-
-        # Handle different potential keys based on relation_label
         if relation_label == 'director':
             answers = [(str(row['directorLabel'])) for row in results]
         elif relation_label == 'publication date':
@@ -811,8 +930,21 @@ Hello! You can ask me factual questions about movies.
         return answers
 
     def predict_with_embeddings(self, entity_uri, relation_uri):
-        head_id = self.ent2id.get(entity_uri)
-        rel_id = self.rel2id.get(relation_uri)
+        print("*"*60)
+        print(f"Predicting euri: {entity_uri} -> ruri: {relation_uri} with embeddings")
+        print("*"*60)
+
+        entity_uri_ref = rdflib.URIRef(entity_uri)
+        relation_uri_ref = rdflib.URIRef(relation_uri)
+
+        print(f"[DEBUG] Converted Entity URI to rdflib.URIRef: {entity_uri_ref}")
+        print(f"[DEBUG] Converted Relation URI to rdflib.URIRef: {relation_uri_ref}")
+
+
+        head_id = self.ent2id.get(entity_uri_ref)
+        rel_id = self.rel2id.get(relation_uri_ref)
+
+        print(f"Head_id {head_id} and Tail_id {rel_id}")
 
         if head_id is None or rel_id is None:
             return None
@@ -835,17 +967,17 @@ Hello! You can ask me factual questions about movies.
         if factual_answers:
             answer_str = ', '.join(factual_answers)
             response = (
-            f"The {relation_label} for {entity_label} is: {answer_str}.\n(Factual Answer)"
+                f"The {relation_label} for {entity_label} is: {answer_str}.\n(Factual Answer)"
             ).encode('ascii', errors='replace').decode('ascii')
         elif embedding_answers:
             answer_str = (
-            f"Our top pick is {embedding_answers[0]},\n "
-            f"But it could also be {embedding_answers[1]}\n "
-            f"Or perhaps {embedding_answers[2]}."
+                f"Our top pick is {embedding_answers[0]},\n "
+                f"But it could also be {embedding_answers[1]}\n "
+                f"Or perhaps {embedding_answers[2]}."
             )
             response = (
-            f"We couldn't find the {relation_label} information for {entity_label} in our knowledge graph.\n\n"
-            f"However, based on our embeddings:\n {answer_str}.\n (Embedding Answer)"
+                f"We couldn't find the {relation_label} information for {entity_label} in our knowledge graph.\n\n"
+                f"However, based on our embeddings:\n {answer_str}.\n (Embedding Answer)"
             ).encode('ascii', errors='replace').decode('ascii')
         else:
             response = f"Sorry, I couldn't find any information about the {relation_label} of {entity_label}."
@@ -855,7 +987,6 @@ Hello! You can ask me factual questions about movies.
         if not recommendations:
             return "I'm sorry, I couldn't find any movie recommendations based on your input."
 
-        # Start building the recommendation message
         formatted_recommendations = "Here are some movies you might enjoy:\n\n"
         for idx, movie_title in enumerate(recommendations, start=1):
             formatted_recommendations += f"{idx}. {movie_title}\n"
@@ -864,86 +995,65 @@ Hello! You can ask me factual questions about movies.
         formatted_recommendations += "\nHappy watching!"
         return formatted_recommendations
 
-
-   
-    def get_subgenres(self, genre_keywords):
-        """
-        Retrieves all subgenres that contain any of the specified genre keywords.
-        The genre list is loaded from genres.txt, and subgenres are matched by checking
-        if any of the keywords are present in each genre name.
-        """
-        # Load genres from genres.txt
+    def load_crowd_data(self, file_path):
+        crowd_data = []
         try:
-            with open("genres.txt", "r") as file:
-                genres = [line.strip() for line in file.readlines()]
+            with open(file_path, 'r') as file:
+                reader = csv.DictReader(file, delimiter='\t')
+                for row in reader:
+                    crowd_data.append(row)
+            print(f"[INFO] Loaded crowd data from {file_path}")
+            return crowd_data
         except FileNotFoundError:
-            print("Error: 'genres.txt' file not found.")
+            print(f"Sorry, the file {file_path} was not found.")
             return []
-        
-        # Ensure genre_keywords is a list (even if a single keyword is passed)
-        if isinstance(genre_keywords, str):
-            genre_keywords = [genre_keywords]
-        
-        # Filter genres to find subgenres containing any keyword in genre_keywords
-        subgenres = [
-            genre for genre in genres 
-            if any(keyword.lower() in genre.lower() for keyword in genre_keywords)
-        ]
-        print(f"Found all the subgenres {subgenres}")
-        if not subgenres:
-            print(f"No subgenres found for keywords: {genre_keywords}")
-            
-        return subgenres
 
+    def extract_movie_title(self, question):
+        question = question.lower().strip().rstrip("?") 
+        if "the princess and the frog" in question:
+            return "The Princess and the Frog"
+        if "tom meets zizou" in question:
+            return "Tom Meets Zizou"
+        if "x-men: first class" in question:
+            return "X-Men: First Class"
+        return ""
 
-    def get_movies_by_genre(self, genre):
-        """
-        SPARQL query to retrieve movies belonging to a specific genre.
-        """
+    def get_triple_key_from_title(self, movie_title):
+        if movie_title.lower() == "the princess and the frog":
+            return ('wd:Q11621', 'wdt:P2142', '792910554')
+        elif movie_title.lower() == "tom meets zizou":
+            return ('wd:Q603545', 'wdt:P2142', '4300000')
+        elif movie_title.lower() == "x-men: first class":
+            return ('wd:Q12345', 'wdt:P2142', '111111111')
+        return None
+
+    def get_movie_year(self, movie_uri):
         query = f"""
         PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-        
-        SELECT ?movieLabel WHERE {{
-            ?movie wdt:P136 ?genre .
-            ?genre rdfs:label "{genre}"@en .
-            ?movie rdfs:label ?movieLabel .
-            FILTER (lang(?movieLabel) = "en")
+        SELECT ?year WHERE {{
+            <{movie_uri}> wdt:P577 ?date .
+            BIND(YEAR(?date) AS ?year)
         }}
-        LIMIT 50
+        LIMIT 1
         """
         try:
             results = self.graph.query(query)
-            movies = [str(row.movieLabel) for row in results]
+            for row in results:
+                return int(row['year'])
         except Exception as e:
-            print(f"Error retrieving movies by genre '{genre}': {e}")
-            return []
-
-        if not movies:
-            print(f"No movies found for genre: {genre}")
-            return []
-        return movies
-
+            print(f"Error retrieving year for {movie_uri}: {e}")
+            return None
 
     def get_movies_by_era(self, eras):
-        """
-        SPARQL query to retrieve movies released within specified eras.
-        """
         parsed_eras = self.parse_era(eras)
         if not parsed_eras:
-            print(f"[DEBUG] No valid eras found in: {eras}")
             return []
-
-        # Build the FILTER clause
         era_filters = " || ".join(
             f"(YEAR(?date) >= {start} && YEAR(?date) <= {end})" for start, end in parsed_eras
         )
-        
         query = f"""
         PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-        PREFIX wd: <http://www.wikidata.org/entity/>
         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-
         SELECT ?movieLabel WHERE {{
             ?movie wdt:P577 ?date .
             FILTER ({era_filters}) .
@@ -958,19 +1068,192 @@ Hello! You can ask me factual questions about movies.
         except Exception as e:
             print(f"Error retrieving movies for eras {eras}: {e}")
             return []
-
-        if not movies:
-            print(f"No movies found for eras: {eras}")
-            return []
         return movies
 
+    def parse_era(self, eras):
+        parsed = []
+        for era in eras:
+            era = era.lower()
+            if 'classic' in era:
+                parsed.append((1900, 1960))  
+            elif 'old' in era or 'retro' in era:
+                parsed.append((1900, 1970))
+            elif 'twentieth century' in era:
+                parsed.append((1900, 1999))
+            elif era.endswith('s') and era[:-1].isdigit():
+                start = int(era[:-1])
+                end = start + 9
+                parsed.append((start, end))
+        return parsed
 
-   
+    def answer_movie_frames_question(self, movie_title):
+        imdb_id = self.get_imdb_id(movie_title)
+        if not imdb_id:
+            return f"Sorry, I couldn't find frames for {movie_title}."
+        frames = self.get_movie_frames(imdb_id)
+        if not frames:
+            return f"Sorry, no frames are available for {movie_title}."
+        frame_url = frames[0]
+        return f"Here is a frame from {movie_title}:\nFrame: {frame_url}"
+
+    def get_imdb_id(self, movie_title):
+        try:
+            with open("movie_imdb_mapping.json", "r") as f:
+                movie_mapping = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+        return movie_mapping.get(movie_title)
+
+    def get_movie_frames(self, imdb_id):
+        base_url = "https://files.ifi.uzh.ch/ddis/teaching/ATAI2024/dataset/movienet/frames/"
+        frames_url = base_url + imdb_id + "/"
+        return [
+            f"{frames_url}shot_0000_img_0.jpg",
+            f"{frames_url}shot_0000_img_1.jpg"
+        ]
+
+    def short_form_uri(self, uri):
+        """
+        Convert a URI (either rdflib.URIRef or string) to the short form used in crowd_aggregates.
+        For entities: http://www.wikidata.org/entity/Q11621 -> wd:Q11621
+        For properties: http://www.wikidata.org/prop/direct/P2142 -> wdt:P2142
+        If already short form, return as is.
+        """
+        if isinstance(uri, rdflib.URIRef):
+            uri = str(uri)
+        if uri.startswith('http://www.wikidata.org/entity/'):
+            return 'wd:' + uri.rsplit('/', 1)[1]
+        elif uri.startswith('http://www.wikidata.org/prop/direct/'):
+            return 'wdt:' + uri.rsplit('/', 1)[1]
+        return uri
+
+    def answer_multimedia_question(self, entity_label):
+        try:
+            with open("actor_imdb_mapping.json", "r") as f:
+                actor_mapping = json.load(f)
+            with open("images.json", "r") as f:
+                images_data = json.load(f)
+        except FileNotFoundError as e:
+            missing_file = str(e).split("'")[-2]
+            return f"Sorry, the required dataset '{missing_file}' is missing."
+
+        imdb_id = actor_mapping.get(entity_label)
+        if not imdb_id:
+            return f"Sorry, I couldn't find IMDb information for {entity_label}."
+
+        base_url = "https://files.ifi.uzh.ch/ddis/teaching/ATAI2024/dataset/movienet/images/"
+        images = []
+        frames = []
+
+        for item in images_data:
+            if imdb_id in item.get("cast", []):
+                image_url = base_url + item["img"]
+                if item.get("type") == "still_frame":
+                    frames.append(image_url)
+                else:
+                    images.append(image_url)
+
+        response_message = []
+
+        if images:
+            image_url = images[0]
+            response_message.append(f"Here is an image of {entity_label}:")
+            response_message.append(f"Image: {image_url}")
+        else:
+            response_message.append(f"Sorry, I couldn't find any images for {entity_label}.")
+
+        if frames:
+            frame_url = frames[0]
+            response_message.append(f"\nHere is a frame of {entity_label}:")
+            response_message.append(f"Frame: {frame_url}")
+        else:
+            response_message.append(f"Sorry, I couldn't find any frames for {entity_label}.")
+
+        return "\n".join(response_message)
+
+    def get_recommendations(self, movie_titles, num_recommendations=5, genre=None, era=None):
+        all_recommendations = []
+
+        if isinstance(era, list) and len(era) > 0:
+            era = era[0]  
+        elif isinstance(era, list):
+            era = None
+
+        if movie_titles:
+            for movie_title in movie_titles:
+                movie_uri = self.match_entity(movie_title)
+                if not movie_uri:
+                    print(f"Movie '{movie_title}' not recognized. Skipping.")
+                    continue
+
+                movie_id = self.ent2id.get(movie_uri)
+                if movie_id is None:
+                    print(f"Embeddings not found for '{movie_title}'. Skipping.")
+                    continue
+
+                target_embedding = self.entity_emb[movie_id].reshape(1, -1)
+                similarities = cosine_similarity(target_embedding, self.entity_emb).flatten()
+
+                similar_indices = np.argsort(-similarities)[1:]  # Exclude the movie itself
+                for idx in similar_indices:
+                    similar_movie_uri = self.id2ent[idx]
+                    similar_movie_title = self.ent2lbl.get(similar_movie_uri)
+
+                    if not similar_movie_title:
+                        continue
+
+                    genres = self.get_movie_genre(similar_movie_uri) or []
+                    genres_lower = [g.lower() for g in genres]
+
+                    if "documentary" in genres_lower:
+                        continue
+
+                    if genre and genre.lower() not in genres_lower:
+                        continue
+
+                    if era and not self.is_within_era(similar_movie_uri, era):
+                        continue
+
+                    all_recommendations.append(similar_movie_title)
+
+                    if len(all_recommendations) >= num_recommendations * len(movie_titles):
+                        break
+
+        else:
+            if genre and era:
+                all_recommendations = self.get_movies_by_genre_and_era(genre, era)
+            elif genre:
+                all_recommendations = self.get_movies_by_genre(genre)
+            elif era:
+                all_recommendations = self.get_movies_by_era(era)
+
+        ranked_recommendations = Counter(all_recommendations)
+        sorted_recommendations = [title for title, _ in ranked_recommendations.most_common(num_recommendations)]
+        final_recommendations = [movie for movie in sorted_recommendations if movie not in movie_titles]
+
+        return final_recommendations[:num_recommendations]
+
+    def get_movie_genre(self, movie_uri):
+        query = f"""
+        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        
+        SELECT ?genreLabel WHERE {{
+            <{movie_uri}> wdt:P136 ?genre .
+            ?genre rdfs:label ?genreLabel .
+            FILTER (lang(?genreLabel) = "en")
+        }}
+        """
+        try:
+            results = self.graph.query(query)
+            genres = [str(row['genreLabel']) for row in results]
+            return genres
+        except Exception as e:
+            print(f"Error retrieving genres for {movie_uri}: {e}")
+            return []
+
     def get_movies_by_genre_and_era(self, genre, era):
-        """
-        SPARQL query to retrieve movies filtered by genre and release year range.
-        """
-        start_year, end_year = self.parse_era(era)
+        start_year, end_year = self.parse_era([era])[0]
         query = f"""
         PREFIX wdt: <http://www.wikidata.org/prop/direct/>
         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -992,362 +1275,33 @@ Hello! You can ask me factual questions about movies.
         except Exception as e:
             print(f"Error retrieving movies for genre '{genre}' and era '{era}': {e}")
             return []
-
-        if not movies:
-            print(f"No movies found for genre '{genre}' in era '{era}'")
-            return []
         return movies
 
-
-    def get_movies_by_broadgenre_era(self, broad_genre, era):
-        """
-        Expands the search for movies by genre and era to include all related subgenres if necessary.
-        """
-        # Get all subgenres related to the broad genre (e.g., all "horror" subgenres)
-        subgenres = self.get_subgenres(broad_genre)
-
-        # Parse the era to get the start and end year
-        start_year, end_year = self.parse_era(era)
-
-        # Build the SPARQL query to include all subgenres and filter by the era range
-        subgenre_filters = " || ".join([f'?genreLabel = "{subgenre}"' for subgenre in subgenres])
+    def get_movies_by_genre(self, genre):
         query = f"""
         PREFIX wdt: <http://www.wikidata.org/prop/direct/>
         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-
-        SELECT ?movieLabel WHERE {{
-            ?movie wdt:P136 ?genre ;
-                   wdt:P577 ?date .
-            ?genre rdfs:label ?genreLabel .
-            FILTER (lang(?genreLabel) = "en" && ({subgenre_filters})) .
-            FILTER (YEAR(?date) >= {start_year} && YEAR(?date) <= {end_year}) .
-            ?movie rdfs:label ?movieLabel .
-        }}
-        LIMIT 50
-        """
-        results = self.graph.query(query)
-        movies = [str(row.movieLabel) for row in results]
-        return movies
-
-    def get_movies_by_broad(self, broad_genre):
-        """
-        Expands the search for movies by including all related subgenres when searching by genre alone.
-        """
-        # Get all subgenres related to the broad genre
-        subgenres = self.get_subgenres(broad_genre)
-
-        # Build the SPARQL query to include all subgenres
-        subgenre_filters = " || ".join([f'?genreLabel = "{subgenre}"' for subgenre in subgenres])
-        query = f"""
-        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-
+        
         SELECT ?movieLabel WHERE {{
             ?movie wdt:P136 ?genre .
-            ?genre rdfs:label ?genreLabel .
-            FILTER (lang(?genreLabel) = "en" && ({subgenre_filters})) .
+            ?genre rdfs:label "{genre}"@en .
             ?movie rdfs:label ?movieLabel .
+            FILTER (lang(?movieLabel) = "en")
         }}
         LIMIT 50
         """
-        results = self.graph.query(query)
-        movies = [str(row.movieLabel) for row in results]
+        try:
+            results = self.graph.query(query)
+            movies = [str(row.movieLabel) for row in results]
+        except Exception as e:
+            print(f"Error retrieving movies by genre '{genre}': {e}")
+            return []
         return movies
 
-    def preprocess_image(self, image_path):
-        """
-        Preprocess the input image for ResNet model.
-        """
-        original_img = read_image(image_path)
-        preprocess_img = self.preprocess(original_img)  # Assumes self.preprocess() is defined elsewhere
-        return original_img, preprocess_img.unsqueeze(0)
-
-    def generate_image_response(self, image_path, entity_label):
-        """
-        Generate an HTML-compatible response with the image and ResNet visualization.
-        """
-
-        try:
-            original_img, preprocess_img = self.preprocess_image(image_path)
-            embedding = self.model(preprocess_img).detach().numpy().reshape(32, 64)
-
-            # Create a figure to visualize the image and embedding
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
-            ax1.imshow(original_img.permute(1, 2, 0).numpy().astype('uint8'))
-            ax1.set_title(entity_label)
-            ax2.imshow(embedding, cmap='viridis')
-            ax2.set_title("Embedding Visualization")
-
-            # Convert the figure to a base64 image
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png')
-            buf.seek(0)
-            encoded_image = base64.b64encode(buf.read()).decode('utf-8')
-            buf.close()
-
-            # HTML response with embedded base64 image
-            html_response = f"""
-            <div>
-                <h3>Image of {entity_label}</h3>
-                <img src="data:image/png;base64,{encoded_image}" alt="Image of {entity_label}" />
-            </div>
-            """
-            return html_response
-        except Exception as e:
-            return f"Sorry, an error occurred while processing the image: {str(e)}"
-
-    def answer_multimedia_question(self, entity_label):
-        """
-        Retrieves a single image (including frames) for a cast member based on their name or IMDb ID,
-        displays it, and includes the link in the chat response.
-        """
-        try:
-            # Load datasets
-            with open("actor_imdb_mapping.json", "r") as f:
-                actor_mapping = json.load(f)
-            with open("images.json", "r") as f:
-                images_data = json.load(f)
-        except FileNotFoundError as e:
-            missing_file = str(e).split("'")[-2]
-            return f"Sorry, the required dataset '{missing_file}' is missing. Please check if the file exists in the project directory."
-
-        # Get IMDb ID for the actor
-        imdb_id = actor_mapping.get(entity_label)
-        if not imdb_id:
-            return f"Sorry, I couldn't find IMDb information for {entity_label}."
-
-        # Search for images and frames of the actor
-        base_url = "https://files.ifi.uzh.ch/ddis/teaching/ATAI2024/dataset/movienet/images/"
-        images = []
-        frames = []
-
-        for item in images_data:
-            if imdb_id in item.get("cast", []):
-                image_url = base_url + item["img"]
-                if item.get("type") == "still_frame":
-                    frames.append(image_url)
-                else:
-                    images.append(image_url)
-
-        # Build the response message with URLs
-        response_message = []
-
-        # Show only one image if available
-        if images:
-            image_url = images[0]  # Get the first image
-            response_message.append(f"Here is an image of {entity_label}:")
-            response_message.append(f"Image: {image_url}")
-
-            # Display the image directly in the chat
-            try:
-                response = requests.get(image_url)
-                response.raise_for_status()
-                img = Image.open(BytesIO(response.content))
-
-                # Display the image with matplotlib
-                plt.imshow(img)
-                plt.axis('off')
-                plt.title(f"Image of {entity_label}")
-                plt.show()
-            except Exception as e:
-                response_message.append(f"Sorry, I found an image for {entity_label}, but there was an issue displaying it.")
-                print(f"[ERROR] Failed to display image: {e}")
-        else:
-            response_message.append(f"Sorry, I couldn't find any images for {entity_label}.")
-
-        # Show only one frame if available
-        if frames:
-            frame_url = frames[0]  # Get the first frame
-            response_message.append(f"\nHere is a frame of {entity_label}:")
-            response_message.append(f"Frame: {frame_url}")
-
-            # Display the frame directly in the chat
-            try:
-                response = requests.get(frame_url)
-                response.raise_for_status()
-                img = Image.open(BytesIO(response.content))
-
-                # Display the frame with matplotlib
-                plt.imshow(img)
-                plt.axis('off')
-                plt.title(f"Frame of {entity_label}")
-                plt.show()
-            except Exception as e:
-                response_message.append(f"Sorry, I found a frame for {entity_label}, but there was an issue displaying it.")
-                print(f"[ERROR] Failed to display frame: {e}")
-        else:
-            response_message.append(f"Sorry, I couldn't find any frames for {entity_label}.")
-
-        return "\n".join(response_message)
-
-    def get_movie_frames(self, imdb_id):
-        """
-        Retrieves URLs of frames for a specific movie based on its IMDb ID.
-        """
-        base_url = "https://files.ifi.uzh.ch/ddis/teaching/ATAI2024/dataset/movienet/frames/"
-        frames_url = base_url + imdb_id + "/"
-
-        # Generate sample frame URLs (modify as needed to dynamically fetch all frames)
-        return [
-            f"{frames_url}shot_0000_img_0.jpg",
-            f"{frames_url}shot_0000_img_1.jpg",
-            f"{frames_url}shot_0001_img_0.jpg",
-        ]
-
-    def answer_movie_frames_question(self, movie_title):
-        """
-        Answers questions about movie frames.
-        """
-        imdb_id = self.get_imdb_id(movie_title)  # Implement or use a mapping function
-        if not imdb_id:
-            return f"Sorry, I couldn't find frames for {movie_title}."
-
-        frames = self.get_movie_frames(imdb_id)
-        if not frames:
-            return f"Sorry, no frames are available for {movie_title}."
-
-        # Only show one frame
-        frame_url = frames[0]
-        return f"Here is a frame from {movie_title}:\nFrame: {frame_url}"
-
-    def get_imdb_id(self, movie_title):
-        """
-        Maps movie titles to IMDb IDs using the generated movie_imdb_mapping.json file.
-        """
-        try:
-            with open("movie_imdb_mapping.json", "r") as f:
-                movie_mapping = json.load(f)
-            print(f"[INFO] Loaded movie mapping from movie_imdb_mapping.json")
-        except (FileNotFoundError, json.JSONDecodeError):
-            print("[ERROR] Movie mapping file not found or is invalid.")
-            return None
-        
-        return movie_mapping.get(movie_title)
-
-    def load_crowd_data(self, file_path):
-        """
-        Loads the crowd data from the TSV file and returns a list of dictionaries.
-        """
-        crowd_data = []
-        try:
-            with open(file_path, 'r') as file:
-                reader = csv.DictReader(file, delimiter='\t')
-                for row in reader:
-                    crowd_data.append(row)
-            print(f"[INFO] Loaded crowd data from {file_path}")
-            return crowd_data
-        except FileNotFoundError:
-            print(f"Sorry, the file {file_path} was not found.")
-            return []
-
-        
-    def get_movie_data(self, movie_title, column_name):
-        """
-        Retrieves specific data (e.g., box office, publication date, executive producer) for a movie.
-        """
-        for row in self.crowd_data:
-            # Match the movie title with Input1ID, Input2ID, or Input3ID in the TSV
-            if movie_title in (row['Input1ID'], row['Input2ID'], row['Input3ID']):
-                return row.get(column_name, "Data not available.")
-        print(f"[DEBUG] No data found for movie title: {movie_title}")  # Add debugging for data matching
-        return "Sorry, no data found for {movie_title}."
-
-   
-    def get_answer_distribution(self, movie_title):
-        """
-        Retrieves the answer distribution and inter-rater agreement for a given movie title.
-        """
-        answer_counts = {"CORRECT": 0, "INCORRECT": 0}
-        workers = []
-        
-        for row in self.crowd_data:
-            # Match movie title with the subject (Input1ID), predicate (Input2ID), or object (Input3ID)
-            if movie_title in (row['Input1ID'], row['Input2ID'], row['Input3ID']):
-                answer_counts[row['AnswerLabel']] += 1
-                workers.append(row['WorkerId'])
-        
-        if len(workers) > 1:
-            # Calculate Fleiss' kappa (inter-rater agreement)
-            kappa = self.calculate_fleiss_kappa(answer_counts)
-        else:
-            kappa = None  # Not enough raters to calculate Fleiss' kappa
-        
-        return answer_counts, kappa
-
-    def calculate_fleiss_kappa(self, answer_counts):
-        """
-        Calculate Fleiss' kappa to measure inter-rater agreement.
-        """
-        total_ratings = sum(answer_counts.values())
-        p_i = {answer: count / total_ratings for answer, count in answer_counts.items()}
-        
-        # Fleiss' kappa formula (simplified version for binary classification)
-        P_e = sum([p * p for p in p_i.values()])
-        P_o = sum([min(count, total_ratings - count) / total_ratings for count in answer_counts.values()])
-        
-        return (P_o - P_e) / (1 - P_e)
-    
-    
-    def answer_crowdsourcing_question(self, question):
-        """
-        Answers crowdsourcing questions based on the question.
-        """
-        question = question.lower()
-
-        if "box office" in question:
-            movie_title = self.extract_movie_title(question)
-            box_office = self.get_movie_data(movie_title, 'box_office')
-            answer_distribution, kappa = self.get_answer_distribution(movie_title)
-            answer = f"The box office of {movie_title} is {box_office}. [Crowd, inter-rater agreement {kappa if kappa else 'N/A'}, The answer distribution for this specific task was {answer_distribution['CORRECT']} support votes, {answer_distribution['INCORRECT']} reject votes]"
-            return answer
-        
-        elif "publication date" in question:
-            movie_title = self.extract_movie_title(question)
-            publication_date = self.get_movie_data(movie_title, 'publication_date')
-            answer_distribution, kappa = self.get_answer_distribution(movie_title)
-            answer = f"The publication date of {movie_title} is {publication_date}. [Crowd, inter-rater agreement {kappa if kappa else 'N/A'}, The answer distribution for this specific task was {answer_distribution['CORRECT']} support votes, {answer_distribution['INCORRECT']} reject votes]"
-            return answer
-        
-        elif "executive producer" in question:
-            movie_title = self.extract_movie_title(question)
-            executive_producer = self.get_movie_data(movie_title, 'executive_producer')
-            answer_distribution, kappa = self.get_answer_distribution(movie_title)
-            answer = f"The executive producer of {movie_title} is {executive_producer}. [Crowd, inter-rater agreement {kappa if kappa else 'N/A'}, The answer distribution for this specific task was {answer_distribution['CORRECT']} support votes, {answer_distribution['INCORRECT']} reject votes]"
-            return answer
-
-        return "Sorry, I couldn't understand the question."
-
-
-    
-    def extract_movie_title(self, question):
-        """
-        Extracts the movie title from the question by stripping unnecessary words.
-        This is an improved version to handle various question patterns.
-        """
-        question = question.lower().strip().rstrip("?")  # Normalize the question
-        # Define question patterns to identify the start of the movie title
-        question_patterns = [
-            "who is the executive producer of",
-            "what is the box office of",
-            "can you tell me the publication date of",
-            "who directed",
-            "who starred in"
-        ]
-        # Try to match the question with one of the patterns
-        for pattern in question_patterns:
-            if question.startswith(pattern):
-                # Extract the movie title by removing the known pattern
-                movie_title = question[len(pattern):].strip()
-                print(f"[DEBUG] Extracted movie title: {movie_title}")  # Add debugging
-                return movie_title
-        
-        # If no pattern matched, return an empty string
-        return ""
-    
+    ######################################################################
     @staticmethod
     def get_time():
         return time.strftime("%H:%M:%S, %d-%m-%Y", time.localtime())
-
 
 if __name__ == '__main__':
     agent = Agent("timid-spirit", "B7uzR8A5")
