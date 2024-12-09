@@ -1129,7 +1129,6 @@ Hello! You can ask me factual questions about movies.
 
     def answer_multimedia_question(self, entity_label):
         try:
-            # Load necessary datasets
             with open("actor_imdb_mapping.json", "r") as f:
                 actor_mapping = json.load(f)
             with open("images.json", "r") as f:
@@ -1138,20 +1137,15 @@ Hello! You can ask me factual questions about movies.
             missing_file = str(e).split("'")[-2]
             return f"Sorry, the required dataset '{missing_file}' is missing."
 
-        # Retrieve IMDb ID for the entity
         imdb_id = actor_mapping.get(entity_label)
         if not imdb_id:
             return f"Sorry, I couldn't find IMDb information for {entity_label}."
-
-        # Find images in movienet/images.json
         relevant_images = [
             item["img"] for item in images_data if imdb_id in item.get("cast", [])
         ]
 
         if not relevant_images:
             return f"Sorry, I couldn't find any images for {entity_label}."
-
-        # Return the first available image index in the required format
         return f"image:{relevant_images[0]}"
 
 
