@@ -1129,6 +1129,7 @@ Hello! You can ask me factual questions about movies.
 
     def answer_multimedia_question(self, entity_label):
         try:
+            # Load necessary datasets
             with open("actor_imdb_mapping.json", "r") as f:
                 actor_mapping = json.load(f)
             with open("images.json", "r") as f:
@@ -1137,39 +1138,22 @@ Hello! You can ask me factual questions about movies.
             missing_file = str(e).split("'")[-2]
             return f"Sorry, the required dataset '{missing_file}' is missing."
 
+        # Retrieve IMDb ID for the entity
         imdb_id = actor_mapping.get(entity_label)
         if not imdb_id:
             return f"Sorry, I couldn't find IMDb information for {entity_label}."
 
-        base_url = "https://files.ifi.uzh.ch/ddis/teaching/ATAI2024/dataset/movienet/images/"
-        images = []
-        frames = []
+        # Find images in movienet/images.json
+        relevant_images = [
+            item["img"] for item in images_data if imdb_id in item.get("cast", [])
+        ]
 
-        for item in images_data:
-            if imdb_id in item.get("cast", []):
-                image_url = base_url + item["img"]
-                if item.get("type") == "still_frame":
-                    frames.append(image_url)
-                else:
-                    images.append(image_url)
+        if not relevant_images:
+            return f"Sorry, I couldn't find any images for {entity_label}."
 
-        response_message = []
+        # Return the first available image index in the required format
+        return f"image:{relevant_images[0]}"
 
-        if images:
-            image_url = images[0]
-            response_message.append(f"Here is an image of {entity_label}:")
-            response_message.append(f"Image: {image_url}")
-        else:
-            response_message.append(f"Sorry, I couldn't find any images for {entity_label}.")
-
-        if frames:
-            frame_url = frames[0]
-            response_message.append(f"\nHere is a frame of {entity_label}:")
-            response_message.append(f"Frame: {frame_url}")
-        else:
-            response_message.append(f"Sorry, I couldn't find any frames for {entity_label}.")
-
-        return "\n".join(response_message)
 
     def get_recommendations(self, movie_titles, num_recommendations=5, genre=None, era=None):
         all_recommendations = []
