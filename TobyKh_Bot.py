@@ -1129,24 +1129,42 @@ Hello! You can ask me factual questions about movies.
 
     def answer_multimedia_question(self, entity_label):
         try:
+            # Load necessary datasets
             with open("actor_imdb_mapping.json", "r") as f:
                 actor_mapping = json.load(f)
             with open("images.json", "r") as f:
                 images_data = json.load(f)
+            with open("movie_imdb_mapping.json", "r") as f:
+                movie_mapping = json.load(f)
         except FileNotFoundError as e:
             missing_file = str(e).split("'")[-2]
             return f"Sorry, the required dataset '{missing_file}' is missing."
 
+        # Check if the entity is an actor
         imdb_id = actor_mapping.get(entity_label)
-        if not imdb_id:
-            return f"Sorry, I couldn't find IMDb information for {entity_label}."
-        relevant_images = [
-            item["img"] for item in images_data if imdb_id in item.get("cast", [])
-        ]
-
-        if not relevant_images:
+        if imdb_id:
+            # Actor-Related Questions
+            actor_images = [
+                item["img"] for item in images_data if imdb_id in item.get("cast", [])
+            ]
+            if actor_images:
+                return f"image:{actor_images[0]}"  # Return the first image of the actor
             return f"Sorry, I couldn't find any images for {entity_label}."
-        return f"image:{relevant_images[0]}"
+
+        # Check if the entity is a movie
+        movie_imdb_id = movie_mapping.get(entity_label)
+        if movie_imdb_id:
+            # Movie-Related Questions
+            movie_frames = [
+                item["img"] for item in images_data
+                if movie_imdb_id in item.get("movie", []) and item.get("type") == "still_frame"
+            ]
+            if movie_frames:
+                return f"image:{movie_frames[0]}"  # Return the first still frame of the movie
+            return f"Sorry, I couldn't find any frames for {entity_label}."
+
+        # Fallback for unknown entities
+        return f"Sorry, I couldn't find any multimedia content for {entity_label}."
 
 
     def get_recommendations(self, movie_titles, num_recommendations=5, genre=None, era=None):
