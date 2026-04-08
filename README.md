@@ -2,7 +2,7 @@
 
 A conversational agent for movie question-answering built for the **Advanced Topics in AI (ATAI)** course at the University of Zurich. The bot connects to UZH's [Speakeasy](https://speakeasy.ifi.uzh.ch) chatroom platform and answers natural-language questions about films, actors, directors, and genres by querying a Wikidata-derived RDF knowledge graph.
 
-<img src="chatbot_demo.gif" width="800"/>
+<img src="chatbot_demo.gif" width="900"/>
 
 ## What it does
 
